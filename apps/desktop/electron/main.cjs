@@ -5487,6 +5487,11 @@ function terminalShellEnv() {
   env.TERM_PROGRAM = 'Hermes'
   env.TERM_PROGRAM_VERSION = app.getVersion()
 
+  // Let a hermes/--tui launched in this pane know it's embedded in the desktop
+  // GUI (build_environment_hints surfaces this). Distinct from HERMES_DESKTOP,
+  // which marks the agent *backend* and gates cron/gateway behavior.
+  env.HERMES_DESKTOP_TERMINAL = '1'
+
   return env
 }
 
