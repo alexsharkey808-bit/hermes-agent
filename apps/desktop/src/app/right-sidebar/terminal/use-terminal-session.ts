@@ -3,10 +3,11 @@ import { Unicode11Addon } from '@xterm/addon-unicode11'
 import { WebLinksAddon } from '@xterm/addon-web-links'
 import { WebglAddon } from '@xterm/addon-webgl'
 import { Terminal } from '@xterm/xterm'
-import { useCallback, useEffect, useRef, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import type { CSSProperties } from 'react'
 
 import { triggerHaptic } from '@/lib/haptics'
+import { useTheme } from '@/themes/context'
 
 import { isAddSelectionShortcut, terminalSelectionAnchor, terminalSelectionLabel, terminalTheme } from './selection'
 
@@ -184,6 +185,9 @@ function quotePathForShell(path: string, shellName: string): string {
 }
 
 export function useTerminalSession({ cwd, onAddSelectionToChat }: UseTerminalSessionOptions) {
+  const { resolvedMode } = useTheme()
+  const activeTheme = useMemo(() => terminalTheme(resolvedMode), [resolvedMode])
+  const initialThemeRef = useRef(activeTheme)
   const hostRef = useRef<HTMLDivElement | null>(null)
   const termRef = useRef<Terminal | null>(null)
   const sessionIdRef = useRef<string | null>(null)
@@ -266,7 +270,7 @@ export function useTerminalSession({ cwd, onAddSelectionToChat }: UseTerminalSes
       lineHeight: 1.12,
       macOptionIsMeta: true,
       scrollback: 1000,
-      theme: terminalTheme()
+      theme: initialThemeRef.current
     })
 
     const fit = new FitAddon()
@@ -492,6 +496,14 @@ export function useTerminalSession({ cwd, onAddSelectionToChat }: UseTerminalSes
       selectionLabelRef.current = ''
     }
   }, [addSelectionToChat, cwd])
+
+  useEffect(() => {
+    const term = termRef.current
+
+    if (term) {
+      term.options.theme = activeTheme
+    }
+  }, [activeTheme])
 
   return {
     addSelectionToChat,

@@ -1,7 +1,7 @@
 import { useEffect, useRef } from 'react'
 import { useNavigate } from 'react-router-dom'
 
-import { setRightSidebarTab } from '@/app/right-sidebar/store'
+import { setTerminalTakeover } from '@/app/right-sidebar/store'
 import { PANE_TOGGLE_REVEAL_EVENT } from '@/components/pane-shell'
 import { matchesQuery } from '@/hooks/use-media-query'
 import { PROFILE_SLOT_COUNT } from '@/lib/keybinds/actions'
@@ -84,9 +84,9 @@ export function useKeybinds(deps: KeybindRuntimeDeps): void {
     }
   }
 
-  const showRightSidebarTab = (tab: 'files' | 'terminal') => {
+  const showFiles = () => {
     setFileBrowserOpen(true)
-    setRightSidebarTab(tab)
+    setTerminalTakeover(false)
   }
 
   handlersRef.current = {
@@ -128,8 +128,8 @@ export function useKeybinds(deps: KeybindRuntimeDeps): void {
         toggleFileBrowserOpen()
       }
     },
-    'view.showFiles': () => showRightSidebarTab('files'),
-    'view.showTerminal': () => showRightSidebarTab('terminal'),
+    'view.showFiles': showFiles,
+    'view.showTerminal': () => setTerminalTakeover(true),
     'view.flipPanes': togglePanesFlipped,
 
     'appearance.toggleMode': () => setMode(resolvedMode === 'dark' ? 'light' : 'dark'),

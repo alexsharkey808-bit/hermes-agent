@@ -2,7 +2,9 @@ import { useStore } from '@nanostores/react'
 import { atom } from 'nanostores'
 import { type CSSProperties, useEffect, useLayoutEffect, useRef, useState } from 'react'
 
-import { TERMINAL_BG } from './selection'
+import { useTheme } from '@/themes/context'
+
+import { terminalTheme } from './selection'
 
 import { TerminalTab } from './index'
 
@@ -56,6 +58,8 @@ const sameRect = (a: Rect | null, b: Rect) =>
 
 export function PersistentTerminal({ cwd, onAddSelectionToChat }: PersistentTerminalProps) {
   const slot = useStore($slot)
+  const { resolvedMode } = useTheme()
+  const theme = terminalTheme(resolvedMode)
   const [rect, setRect] = useState<Rect | null>(null)
   const [ready, setReady] = useState(false)
 
@@ -107,7 +111,7 @@ export function PersistentTerminal({ cwd, onAddSelectionToChat }: PersistentTerm
     visibility: visible ? 'visible' : 'hidden',
     pointerEvents: visible ? 'auto' : 'none',
     zIndex: 4,
-    backgroundColor: TERMINAL_BG,
+    backgroundColor: theme.background,
     contain: 'layout size paint'
   }
 

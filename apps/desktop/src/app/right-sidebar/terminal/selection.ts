@@ -1,38 +1,55 @@
 import type { ITheme, Terminal } from '@xterm/xterm'
 import type { CSSProperties } from 'react'
 
-// Solarized-derived palette, but with bright ANSI 8–15 promoted to real
-// accent variants instead of Schoonover's UI grays. Hermes' TUI skins (gold,
-// crimson, ...) emit bright SGR codes that would otherwise wash out to gray.
-// We always render the dark canvas — the app's light surfaces can't host the
-// default skin without dropping below readable contrast.
-export const TERMINAL_BG = '#002b36'
-
-const THEME: ITheme = {
-  background: TERMINAL_BG,
-  foreground: '#839496',
-  cursor: '#93a1a1',
-  cursorAccent: TERMINAL_BG,
-  selectionBackground: '#586e7555',
-  black: '#073642',
-  red: '#dc322f',
-  green: '#859900',
-  yellow: '#b58900',
-  blue: '#268bd2',
-  magenta: '#d33682',
-  cyan: '#2aa198',
-  white: '#eee8d5',
-  brightBlack: '#586e75',
-  brightRed: '#f25c54',
-  brightGreen: '#b3d437',
-  brightYellow: '#f7c948',
-  brightBlue: '#5fb3ff',
-  brightMagenta: '#ff6ab4',
-  brightCyan: '#5cd9c8',
-  brightWhite: '#fdf6e3'
+const DARK_THEME: ITheme = {
+  background: '#0f172a',
+  foreground: '#dbe4ff',
+  cursor: '#f8fafc',
+  cursorAccent: '#0f172a',
+  selectionBackground: '#93c5fd55',
+  black: '#1e293b',
+  red: '#f87171',
+  green: '#4ade80',
+  yellow: '#facc15',
+  blue: '#60a5fa',
+  magenta: '#c084fc',
+  cyan: '#22d3ee',
+  white: '#e2e8f0',
+  brightBlack: '#64748b',
+  brightRed: '#fca5a5',
+  brightGreen: '#86efac',
+  brightYellow: '#fde047',
+  brightBlue: '#93c5fd',
+  brightMagenta: '#d8b4fe',
+  brightCyan: '#67e8f9',
+  brightWhite: '#f8fafc'
 }
 
-export const terminalTheme = (): ITheme => THEME
+const LIGHT_THEME: ITheme = {
+  background: '#f8fafc',
+  foreground: '#1f2937',
+  cursor: '#111827',
+  cursorAccent: '#f8fafc',
+  selectionBackground: '#60a5fa44',
+  black: '#1f2937',
+  red: '#dc2626',
+  green: '#15803d',
+  yellow: '#a16207',
+  blue: '#1d4ed8',
+  magenta: '#9333ea',
+  cyan: '#0e7490',
+  white: '#d1d5db',
+  brightBlack: '#4b5563',
+  brightRed: '#ef4444',
+  brightGreen: '#22c55e',
+  brightYellow: '#eab308',
+  brightBlue: '#3b82f6',
+  brightMagenta: '#a855f7',
+  brightCyan: '#06b6d4',
+  brightWhite: '#111827'
+}
+
+export const terminalTheme = (mode: 'light' | 'dark'): ITheme => (mode === 'dark' ? DARK_THEME : LIGHT_THEME)
 
 export const isMacPlatform = () => navigator.platform.toLowerCase().includes('mac')
 
