@@ -36,6 +36,8 @@ import re
 import sys
 import threading
 import time
+import urllib.error
+import urllib.request
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional
@@ -441,6 +443,176 @@ class EventBridge:
                 latest = max(all_ts)
                 if latest > last_seen:
                     self._last_poll_timestamps[session_key] = latest
+
+
+# ---------------------------------------------------------------------------
+# Gateway run API (run-driving tools)
+#
+# These talk to the local gateway HTTP API (POST /v1/runs, GET /v1/runs/{id},
+# the /v1/runs/{id}/events SSE stream, POST /v1/runs/{id}/approval) — NOT the
+# in-process messaging bridge. The request/stream/auth pattern mirrors
+# bin/cw_hermes.py: stdlib urllib, bearer auth from API_SERVER_KEY. The key is
+# only ever used as a bearer token; it is never logged or returned.
+# ---------------------------------------------------------------------------
+
+# Act-vs-analysis is conveyed by the run's `instructions` string (there is no
+# wire `act` flag) — these are the exact strings bin/cw_hermes.py uses.
+_GATEWAY_ACT_INSTRUCTIONS = (
+    "You are authorized to take the actions described in this message."
+)
+_GATEWAY_ANALYSIS_INSTRUCTIONS = "Answer only; take no actions, modify nothing."
+
+_RUN_APPROVAL_CHOICES = {"once", "session", "always", "deny"}
+
+
+def _gateway_base() -> str:
+    """Base URL of the local Hermes gateway HTTP API."""
+    return os.environ.get("HERMES_GATEWAY_URL", "http://127.0.0.1:8644")
+
+
+def _gateway_headers() -> Dict[str, str]:
+    """Auth + content-type headers for gateway HTTP requests.
+
+    Reads ``API_SERVER_KEY`` from the environment or ``~/.hermes/.env`` (the
+    same way bin/cw_hermes.py does). The key is used only as a bearer token and
+    is never logged or returned in any tool result.
+    """
+    key = os.environ.get("API_SERVER_KEY")
+    if not key:
+        try:
+            with open(os.path.expanduser("~/.hermes/.env"), encoding="utf-8") as fh:
+                for line in fh:
+                    if line.startswith("API_SERVER_KEY="):
+                        key = line.split("=", 1)[1].strip().strip('"').strip("'")
+                        break
+        except OSError:
+            pass
+    if not key:
+        raise RuntimeError(
+            "API_SERVER_KEY not found in environment or ~/.hermes/.env"
+        )
+    return {"Authorization": "Bearer " + key, "Content-Type": "application/json"}
+
+
+def _gateway_request(
+    method: str,
+    path: str,
+    body: Optional[dict] = None,
+    timeout: int = 30,
+) -> dict:
+    """Make one authenticated JSON request to the gateway HTTP API.
+
+    Returns the decoded JSON response. Mirrors bin/cw_hermes.py's ``_req``.
+    """
+    data = json.dumps(body).encode() if body is not None else None
+    req = urllib.request.Request(
+        _gateway_base() + path, data=data, method=method, headers=_gateway_headers()
+    )
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return json.loads(resp.read().decode())
+
+
+def _run_start_impl(
+    task: str,
+    act: bool = False,
+    session_id: Optional[str] = None,
+) -> str:
+    """Implementation for the run_start tool (see the wrapper docstring)."""
+    body = {
+        "input": task,
+        "instructions": (
+            _GATEWAY_ACT_INSTRUCTIONS if act else _GATEWAY_ANALYSIS_INSTRUCTIONS
+        ),
+    }
+    if session_id:
+        body["session_id"] = session_id
+    try:
+        run = _gateway_request("POST", "/v1/runs", body=body)
+    except (urllib.error.URLError, OSError, ValueError, RuntimeError) as exc:
+        return json.dumps({"error": str(exc)})
+    return json.dumps({
+        "run_id": run.get("run_id", ""),
+        "session_id": run.get("session_id", ""),
+        "status": run.get("status", ""),
+    })
+
+
+def _run_await_impl(run_id: str) -> str:
+    """Implementation for the run_await tool (see the wrapper docstring)."""
+    pending_approval = None
+    try:
+        req = urllib.request.Request(
+            _gateway_base() + "/v1/runs/%s/events" % run_id,
+            headers=_gateway_headers(),
+        )
+        with urllib.request.urlopen(req, timeout=600) as resp:
+            for raw in resp:
+                line = raw.decode("utf-8", "replace").strip()
+                if not line or line.startswith(":"):
+                    continue
+                if not line.startswith("data:"):
+                    continue
+                try:
+                    ev = json.loads(line[5:].strip())
+                except ValueError:
+                    # Partial/split SSE frame — skip it, never crash.
+                    continue
+                if ev.get("event") == "approval.request":
+                    pending_approval = {
+                        "approval_id": (
+                            ev.get("approval_id")
+                            or ev.get("id")
+                            or ev.get("session_key", "")
+                        ),
+                        "summary": (
+                            ev.get("summary") or ev.get("preview") or ev.get("tool", "")
+                        ),
+                    }
+                    break
+    except Exception:
+        # The SSE stream closing as the run finishes is normal; the single
+        # status GET below is the authoritative completion signal.
+        pass
+
+    try:
+        status = _gateway_request("GET", "/v1/runs/%s" % run_id)
+    except (urllib.error.URLError, OSError, ValueError, RuntimeError) as exc:
+        return json.dumps({"error": str(exc)})
+
+    result = {
+        "run_id": run_id,
+        "status": status.get("status", ""),
+        "output": status.get("output", ""),
+        "usage": status.get("usage", {}) or {},
+    }
+    if status.get("status") == "waiting_for_approval":
+        result["approval"] = pending_approval or {}
+    return json.dumps(result)
+
+
+def _run_status_impl(run_id: str) -> str:
+    """Implementation for the run_status tool (see the wrapper docstring)."""
+    try:
+        status = _gateway_request("GET", "/v1/runs/%s" % run_id)
+    except (urllib.error.URLError, OSError, ValueError, RuntimeError) as exc:
+        return json.dumps({"error": str(exc)})
+    return json.dumps(status, indent=2)
+
+
+def _run_approve_impl(run_id: str, choice: str) -> str:
+    """Implementation for the run_approve tool (see the wrapper docstring)."""
+    if choice not in _RUN_APPROVAL_CHOICES:
+        return json.dumps({
+            "error": f"Invalid choice: {choice}. "
+                     f"Must be once, session, always, or deny"
+        })
+    try:
+        result = _gateway_request(
+            "POST", "/v1/runs/%s/approval" % run_id, body={"choice": choice}
+        )
+    except (urllib.error.URLError, OSError, ValueError, RuntimeError) as exc:
+        return json.dumps({"error": str(exc)})
+    return json.dumps(result, indent=2)
 
 
 # ---------------------------------------------------------------------------
@@ -855,6 +1027,79 @@ def create_mcp_server(event_bridge: Optional[EventBridge] = None) -> "FastMCP":
 
         result = bridge.respond_to_approval(id, decision)
         return json.dumps(result, indent=2)
+
+    # -- run_start ---------------------------------------------------------
+
+    @mcp.tool()
+    def run_start(
+        task: str,
+        act: bool = False,
+        session_id: Optional[str] = None,
+    ) -> str:
+        """Start a Hermes gateway run (POST /v1/runs) and return immediately.
+
+        The run executes asynchronously on the gateway. Use run_await to wait
+        for it to finish (or pause for approval), or run_status to poll.
+
+        Args:
+            task: The instruction/prompt for the run.
+            act: When True, authorizes Hermes to take real actions (edit files,
+                run commands, send messages). This is gated by the caller's
+                STOP/scope — only set it for authorized work. When False
+                (default) the run is analysis-only and modifies nothing.
+            session_id: Continue an existing session/thread when provided.
+        """
+        return _run_start_impl(task, act=act, session_id=session_id)
+
+    # -- run_await ---------------------------------------------------------
+
+    @mcp.tool()
+    def run_await(run_id: str) -> str:
+        """Wait for a gateway run to reach a terminal or paused state.
+
+        Streams /v1/runs/{run_id}/events and stops as soon as EITHER the stream
+        closes OR an approval.request event arrives (a run paused for approval
+        does NOT close its stream), then does exactly ONE GET /v1/runs/{run_id}.
+
+        Returns {run_id, status, output, usage}. When status is
+        "waiting_for_approval", also includes "approval" (id + summary) — resolve
+        it with run_approve, then call run_await again. completed/failed/
+        cancelled are terminal.
+
+        Args:
+            run_id: The run id returned by run_start.
+        """
+        return _run_await_impl(run_id)
+
+    # -- run_status --------------------------------------------------------
+
+    @mcp.tool()
+    def run_status(run_id: str) -> str:
+        """Fetch a gateway run's current status (single GET, no streaming).
+
+        A cheap polling alternative to run_await. Returns the run status object
+        as-is (status, output, usage, timestamps, ...).
+
+        Args:
+            run_id: The run id returned by run_start.
+        """
+        return _run_status_impl(run_id)
+
+    # -- run_approve -------------------------------------------------------
+
+    @mcp.tool()
+    def run_approve(run_id: str, choice: str) -> str:
+        """Resolve a gateway run paused at waiting_for_approval.
+
+        POSTs /v1/runs/{run_id}/approval. This is the ONLY approval path for
+        gateway runs — the messaging permissions_respond tool does NOT resolve
+        run approvals.
+
+        Args:
+            run_id: The run id that is waiting_for_approval.
+            choice: One of "once", "session", "always", or "deny".
+        """
+        return _run_approve_impl(run_id, choice)
 
     return mcp
 
