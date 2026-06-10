@@ -765,6 +765,11 @@ class APIServerAdapter(BasePlatformAdapter):
         # resolves requests by session key, while API clients address the
         # in-flight run by run_id.
         self._run_approval_sessions: Dict[str, str] = {}
+        # Per-run tool-event buffer for lossless telemetry (filled at the tool
+        # callback, flushed at the terminal status). Only created for a run when
+        # gateway.telemetry.enabled is true.
+        self._run_tool_buffers: Dict[str, list] = {}
+        self._telemetry_cfg_cache: Optional[Dict[str, Any]] = None
         self._session_db: Optional[Any] = None  # Lazy-init SessionDB for session continuity
 
     @staticmethod
@@ -3561,6 +3566,60 @@ class APIServerAdapter(BasePlatformAdapter):
     _RUN_STREAM_TTL = 300  # seconds before orphaned runs are swept
     _RUN_STATUS_TTL = 3600  # seconds to retain terminal run status for polling
 
+    def _telemetry_cfg(self) -> Dict[str, Any]:
+        """Read the ``gateway.telemetry`` config once (cached for this process).
+
+        The gateway loads raw YAML, so this reads it defensively with in-code
+        defaults — a missing/disabled block makes capture a no-op.
+        """
+        cfg = self._telemetry_cfg_cache
+        if cfg is None:
+            try:
+                from gateway.run import _load_gateway_config
+                full = _load_gateway_config() or {}
+                cfg = (full.get("gateway") or {}).get("telemetry") or {}
+            except Exception:
+                cfg = {}
+            self._telemetry_cfg_cache = cfg
+        return cfg
+
+    def _telemetry_enabled(self) -> bool:
+        return bool(self._telemetry_cfg().get("enabled", False))
+
+    def _flush_run_telemetry(self, run_id: str) -> None:
+        """Persist a terminal run's buffered tool events (best-effort).
+
+        Called once at the run's terminal chokepoint. No-op when telemetry is
+        disabled (no buffer was created). Never raises into the run path.
+        """
+        buf = self._run_tool_buffers.pop(run_id, None)
+        if buf is None:
+            return
+        try:
+            status_obj = self._run_statuses.get(run_id, {}) or {}
+            status = status_obj.get("status", "")
+            if status not in ("completed", "failed", "cancelled"):
+                return
+            usage = status_obj.get("usage") or {}
+            from gateway import telemetry_store
+            telemetry_store.record_run(
+                {
+                    "run_id": run_id,
+                    "session_id": status_obj.get("session_id", ""),
+                    "status": status,
+                    "input_tokens": usage.get("input_tokens"),
+                    "output_tokens": usage.get("output_tokens"),
+                    "total_tokens": usage.get("total_tokens"),
+                    "tool_count": len(buf),
+                    "started_at": status_obj.get("created_at"),
+                    "ended_at": status_obj.get("updated_at"),
+                },
+                buf,
+                store_path=self._telemetry_cfg().get("store_path"),
+            )
+        except Exception:
+            logger.exception("[api_server] telemetry flush failed for run %s", run_id)
+
     def _set_run_status(self, run_id: str, status: str, **fields: Any) -> Dict[str, Any]:
         """Update pollable run status without exposing private agent objects."""
         now = time.time()
@@ -3611,6 +3670,17 @@ class APIServerAdapter(BasePlatformAdapter):
                     "duration": round(kwargs.get("duration", 0), 3),
                     "error": kwargs.get("is_error", False),
                 })
+                # Lossless telemetry: also record the completed tool call in the
+                # per-run buffer (no-op when telemetry is disabled — no buffer).
+                buf = self._run_tool_buffers.get(run_id)
+                if buf is not None:
+                    dur = round(kwargs.get("duration", 0), 3)
+                    buf.append({
+                        "tool": tool_name,
+                        "duration": dur,
+                        "is_error": bool(kwargs.get("is_error", False)),
+                        "started_at": ts - dur,
+                    })
             elif event_type == "reasoning.available":
                 _push({
                     "event": "reasoning.available",
@@ -3710,6 +3780,8 @@ class APIServerAdapter(BasePlatformAdapter):
         self._run_streams[run_id] = q
         self._run_streams_created[run_id] = created_at
         self._run_approval_sessions[run_id] = approval_session_key
+        if self._telemetry_enabled():
+            self._run_tool_buffers[run_id] = []
 
         event_cb = self._make_run_event_callback(run_id, loop)
 
@@ -3880,6 +3952,10 @@ class APIServerAdapter(BasePlatformAdapter):
                 except Exception:
                     pass
             finally:
+                # Persist lossless telemetry for this terminal run (no-op when
+                # disabled). Best-effort — runs after the terminal status is set
+                # and never breaks the run path.
+                self._flush_run_telemetry(run_id)
                 # If the asyncio wrapper is cancelled (for example via
                 # /stop), the executor thread can still be blocked waiting
                 # on an approval Event.  Unregistering here releases those
