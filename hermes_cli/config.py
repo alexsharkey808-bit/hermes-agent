@@ -2189,6 +2189,13 @@ DEFAULT_CONFIG = {
         # multi-tool agent turn. Bridged to HERMES_MEDIA_TRUST_RECENT_SECONDS.
         # Only consulted when ``strict`` is true.
         "trust_recent_files_seconds": 600,
+        # Lossless run-telemetry capture (gateway run tool events -> sqlite).
+        # Read by the gateway at run time; capture is a no-op when disabled.
+        "telemetry": {
+            "enabled": False,                # master switch for run-telemetry capture
+            "store_path": "telemetry.db",    # sqlite file, relative to HERMES_HOME
+            "events": ["tool.started", "tool.completed"],
+        },
     },
 
     # Real-time token streaming to messaging platforms (Telegram, Discord,
