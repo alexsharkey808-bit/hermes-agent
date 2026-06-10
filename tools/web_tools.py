@@ -227,6 +227,8 @@ def _is_backend_available(backend: str) -> bool:
         return _has_env("BRAVE_SEARCH_API_KEY")
     if backend == "ddgs":
         return _ddgs_package_importable()
+    if backend == "trafilatura":
+        return _trafilatura_package_importable()
     if backend == "xai":
         # Cheap probe — env var OR auth.json has OAuth tokens. Must not
         # call resolve_xai_http_credentials() here because the OAuth path
@@ -250,6 +252,21 @@ def _ddgs_package_importable() -> bool:
     """
     try:
         import ddgs  # noqa: F401
+        return True
+    except ImportError:
+        return False
+
+
+def _trafilatura_package_importable() -> bool:
+    """Return True when the ``trafilatura`` package can be imported.
+
+    The free in-process page reader (``web.extract_backend: trafilatura``) is
+    available when its opt-in extra is installed. Mirrors
+    ``_ddgs_package_importable`` so ``_is_backend_available`` and tests share a
+    single monkeypatchable symbol.
+    """
+    try:
+        import trafilatura  # noqa: F401
         return True
     except ImportError:
         return False
@@ -781,6 +798,47 @@ def _ensure_web_plugins_loaded() -> None:
         logger.warning("Web plugin discovery failed (non-fatal): %s", exc)
 
 
+def _get_search_retries() -> int:
+    """Extra retry attempts on a failed/empty ``web_search`` (config-gated).
+
+    Read from ``web.search_retries`` (default 0 = OFF, which preserves the
+    "explicit config = explicit errors" contract). Lets single-engine keyless
+    backends like ddgs ride out a transient DuckDuckGo rate-limit. Clamped to
+    a small ceiling so a misconfig can't spin unbounded.
+    """
+    try:
+        n = int(_load_web_config().get("search_retries", 0))
+    except (TypeError, ValueError):
+        return 0
+    return max(0, min(n, 5))
+
+
+def _search_with_retry(provider, query: str, limit: int) -> dict:
+    """Call ``provider.search`` with optional retry/backoff on failure/empty.
+
+    With ``web.search_retries: 0`` (default) this is a single call — byte-for
+    -byte the pre-retry behaviour. When >0, a retry fires only when the result
+    is unsuccessful OR returns zero web hits (ddgs surfaces a rate-limit as
+    ``success: False``/empty, not an exception), using exponential backoff.
+    """
+    import time
+
+    retries = _get_search_retries()
+    response = provider.search(query, limit)
+    attempt = 0
+    while attempt < retries:
+        if bool(response.get("success")) and response.get("data", {}).get("web"):
+            break
+        attempt += 1
+        time.sleep(0.6 * (2 ** (attempt - 1)))  # 0.6s, 1.2s, 2.4s, ...
+        logger.info(
+            "web_search retry %d/%d via %s (transient failure/empty)",
+            attempt, retries, getattr(provider, "name", "?"),
+        )
+        response = provider.search(query, limit)
+    return response
+
+
 def web_search_tool(query: str, limit: int = 5) -> str:
     """
     Search the web for information using available search API backend.
@@ -868,7 +926,7 @@ def web_search_tool(query: str, limit: int = 5) -> str:
                 "Web search via %s: '%s' (limit: %d)",
                 provider.name, query, limit,
             )
-            response_data = provider.search(query, limit)
+            response_data = _search_with_retry(provider, query, limit)
 
         debug_call_data["results_count"] = len(response_data.get("data", {}).get("web", []))
         result_json = json.dumps(response_data, indent=2, ensure_ascii=False)
