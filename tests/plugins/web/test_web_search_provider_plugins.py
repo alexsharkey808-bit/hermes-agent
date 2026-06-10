@@ -2,7 +2,7 @@
 
 Covers:
 
-- All eight bundled plugins (brave-free, ddgs, searxng, exa, parallel,
+- All nine bundled plugins (brave-free, ddgs, searxng, exa, parallel,
   tavily, firecrawl, xai) instantiate and self-report the expected
   capabilities + ABC-derived defaults.
 - Each plugin's ``is_available()`` correctly reflects env-var presence.
@@ -68,7 +68,7 @@ def _isolate_env(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 class TestBundledPluginsRegister:
-    """All eight bundled web plugins discover and register correctly."""
+    """All nine bundled web plugins discover and register correctly."""
 
     def test_all_seven_plugins_present_in_registry(self) -> None:
         _ensure_plugins_loaded()
@@ -83,6 +83,7 @@ class TestBundledPluginsRegister:
             "parallel",
             "searxng",
             "tavily",
+            "trafilatura",
             "xai",
         ]
 
@@ -98,6 +99,8 @@ class TestBundledPluginsRegister:
             ("firecrawl", True, True),
             # xai: search-only via Grok's agentic web_search tool.
             ("xai", True, False),
+            # trafilatura: extract-only free in-process page reader.
+            ("trafilatura", False, True),
         ],
     )
     def test_capability_flags_match_spec(
@@ -116,7 +119,7 @@ class TestBundledPluginsRegister:
 
     @pytest.mark.parametrize(
         "plugin_name",
-        ["brave-free", "ddgs", "searxng", "exa", "parallel", "tavily", "firecrawl", "xai"],
+        ["brave-free", "ddgs", "searxng", "exa", "parallel", "tavily", "firecrawl", "xai", "trafilatura"],
     )
     def test_each_plugin_has_name_and_display_name(self, plugin_name: str) -> None:
         _ensure_plugins_loaded()
@@ -129,7 +132,7 @@ class TestBundledPluginsRegister:
 
     @pytest.mark.parametrize(
         "plugin_name",
-        ["brave-free", "ddgs", "searxng", "exa", "parallel", "tavily", "firecrawl", "xai"],
+        ["brave-free", "ddgs", "searxng", "exa", "parallel", "tavily", "firecrawl", "xai", "trafilatura"],
     )
     def test_each_plugin_has_setup_schema(self, plugin_name: str) -> None:
         """``get_setup_schema()`` returns a dict the picker can consume."""

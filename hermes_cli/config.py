@@ -997,6 +997,7 @@ DEFAULT_CONFIG = {
         "backend": "",           # shared fallback — applies to both search and extract
         "search_backend": "",    # per-capability override for web_search (e.g. "searxng")
         "extract_backend": "",   # per-capability override for web_extract (e.g. "native")
+        "search_retries": 0,     # extra retry attempts on a failed/empty web_search (0 = off)
     },
 
     "browser": {
