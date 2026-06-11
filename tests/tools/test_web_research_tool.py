@@ -1,12 +1,13 @@
 """Tests for the gated web_research tool (parallel fan-out + query-aware inline extracts).
 
-No network: web_search_tool / web_extract_tool / process_content_with_llm are faked. HERMES_HOME
+No network: web_search_tool / web_extract_tool / summarize_for_query are faked. HERMES_HOME
 is the per-test temp dir (the _isolate_hermes_home autouse fixture), so scratch dirs land in temp.
 
-web_research now summarizes each fetched page through the cheap aux model with the search query
-and returns the query-relevant extract INLINE in each ref's "extract" field (the extract — not the
-raw page — is what lands on disk). The mocks patch the names where web_research_tool LOOKS THEM UP
-(`wr.process_content_with_llm` / `wr.web_extract_tool`), not where they're defined.
+web_research summarizes each fetched page through the cheap aux model with the search query
+(via the fork-owned ``tools.web_research_summarizer.summarize_for_query`` overlay) and returns the
+query-relevant extract INLINE in each ref's "extract" field (the extract — not the raw page — is
+what lands on disk). The mocks patch the names where web_research_tool LOOKS THEM UP
+(`wr.summarize_for_query` / `wr.web_extract_tool`), not where they're defined.
 """
 
 import asyncio
@@ -47,15 +48,15 @@ def _set_flag(monkeypatch, enabled):
 
 
 # --------------------------------------------------------------------------
-# Task 3 — async fanout + inline query-aware extracts
+# async fanout + inline query-aware extracts
 # --------------------------------------------------------------------------
 
 def test_async_fanout_writes_extracts_and_returns_refs(tmp_path, monkeypatch):
     monkeypatch.setattr(wr, "web_search_tool", _fake_search)
     monkeypatch.setattr(wr, "web_extract_tool", _fake_extract_ok)
-    # short mocked bodies (<5000 chars) → process_content_with_llm returns None (no network);
+    # short mocked bodies (<5000 chars) → summarize_for_query returns None (no network);
     # mock it explicitly for determinism → _fetch falls back to the (capped) raw body.
-    monkeypatch.setattr(wr, "process_content_with_llm", AsyncMock(return_value=None))
+    monkeypatch.setattr(wr, "summarize_for_query", AsyncMock(return_value=None))
     scratch = tmp_path / "s"
     scratch.mkdir()
 
@@ -83,24 +84,25 @@ def test_async_fanout_writes_extracts_and_returns_refs(tmp_path, monkeypatch):
 def test_query_and_title_forwarded_to_summarizer(tmp_path, monkeypatch):
     monkeypatch.setattr(wr, "web_search_tool", _fake_search)
     monkeypatch.setattr(wr, "web_extract_tool", _fake_extract_ok)  # title "t"
-    pcwl = AsyncMock(return_value="EXTRACT")
-    monkeypatch.setattr(wr, "process_content_with_llm", pcwl)
+    summ = AsyncMock(return_value="EXTRACT")
+    monkeypatch.setattr(wr, "summarize_for_query", summ)
     scratch = tmp_path / "s"
     scratch.mkdir()
 
     refs = asyncio.run(wr._fanout("my query", 1, scratch))
 
     assert len(refs) == 1
-    pcwl.assert_awaited()
-    _, kwargs = pcwl.call_args
-    assert kwargs.get("query") == "my query"          # the search query is forwarded
+    summ.assert_awaited()
+    args, kwargs = summ.call_args
+    # _fetch calls summarize_for_query(content, query, url=url, title=title) — query is POSITIONAL.
+    assert args[1] == "my query"                      # the search query is forwarded (positional)
     assert kwargs.get("title") == "t"                 # title comes from the web_extract result
 
 
 def test_refs_carry_inline_extract(tmp_path, monkeypatch):
     monkeypatch.setattr(wr, "web_search_tool", _fake_search)
     monkeypatch.setattr(wr, "web_extract_tool", _fake_extract_ok)
-    monkeypatch.setattr(wr, "process_content_with_llm", AsyncMock(return_value="EXTRACT"))
+    monkeypatch.setattr(wr, "summarize_for_query", AsyncMock(return_value="EXTRACT"))
     scratch = tmp_path / "s"
     scratch.mkdir()
 
@@ -116,7 +118,7 @@ def test_refs_carry_inline_extract(tmp_path, monkeypatch):
 def test_none_extract_falls_back_to_raw(tmp_path, monkeypatch):
     monkeypatch.setattr(wr, "web_search_tool", _fake_search)
     monkeypatch.setattr(wr, "web_extract_tool", _fake_extract_ok)  # raw content "BODY-<url>"
-    monkeypatch.setattr(wr, "process_content_with_llm", AsyncMock(return_value=None))
+    monkeypatch.setattr(wr, "summarize_for_query", AsyncMock(return_value=None))
     scratch = tmp_path / "s"
     scratch.mkdir()
 
@@ -133,7 +135,7 @@ def test_placeholder_extract_falls_back_to_raw(tmp_path, monkeypatch):
     monkeypatch.setattr(wr, "web_extract_tool", _fake_extract_ok)
     # the >2M-char placeholder must NOT be stored as a "query-relevant extract"
     placeholder = "[Content too large to process: 3.0MB. Try a more focused source URL.]"
-    monkeypatch.setattr(wr, "process_content_with_llm", AsyncMock(return_value=placeholder))
+    monkeypatch.setattr(wr, "summarize_for_query", AsyncMock(return_value=placeholder))
     scratch = tmp_path / "s"
     scratch.mkdir()
 
@@ -147,20 +149,20 @@ def test_placeholder_extract_falls_back_to_raw(tmp_path, monkeypatch):
 def test_skips_error_and_empty_results(tmp_path, monkeypatch):
     monkeypatch.setattr(wr, "web_search_tool", _fake_search)
     monkeypatch.setattr(wr, "web_extract_tool", _fake_extract_all_fail)
-    # process_content_with_llm must NOT be reached for error/empty pages (skipped earlier)
-    pcwl = AsyncMock(return_value="EXTRACT")
-    monkeypatch.setattr(wr, "process_content_with_llm", pcwl)
+    # summarize_for_query must NOT be reached for error/empty pages (skipped earlier)
+    summ = AsyncMock(return_value="EXTRACT")
+    monkeypatch.setattr(wr, "summarize_for_query", summ)
     scratch = tmp_path / "s"
     scratch.mkdir()
 
     refs = asyncio.run(wr._fanout("q", 3, scratch))
 
     assert refs == []                 # every error/empty result is skipped → one ref per usable URL
-    pcwl.assert_not_awaited()
+    summ.assert_not_awaited()
 
 
 # --------------------------------------------------------------------------
-# Task 4 — tool gate / run-id scratch / serial fallback
+# tool gate / run-id scratch / serial fallback
 # --------------------------------------------------------------------------
 
 def test_flag_off_hides_tool(monkeypatch):
@@ -178,7 +180,7 @@ def test_returns_refs_when_enabled(monkeypatch):
     _set_flag(monkeypatch, True)
     monkeypatch.setattr(wr, "web_search_tool", _fake_search)
     monkeypatch.setattr(wr, "web_extract_tool", _fake_extract_ok)
-    monkeypatch.setattr(wr, "process_content_with_llm", AsyncMock(return_value="EXTRACT"))
+    monkeypatch.setattr(wr, "summarize_for_query", AsyncMock(return_value="EXTRACT"))
 
     out1 = json.loads(asyncio.run(wr.web_research_tool("q", k=3)))
     out2 = json.loads(asyncio.run(wr.web_research_tool("q", k=3)))
