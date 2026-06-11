@@ -32,7 +32,8 @@ from uuid import uuid4
 from hermes_constants import get_hermes_home
 from retrieval.search_primitives import Caps, EgressDenied
 from tools.registry import registry
-from tools.web_tools import _load_web_config, process_content_with_llm, web_extract_tool, web_search_tool
+from tools.web_research_summarizer import summarize_for_query
+from tools.web_tools import _load_web_config, web_extract_tool, web_search_tool
 
 logger = logging.getLogger(__name__)
 
@@ -80,7 +81,7 @@ def _search_hits(query: str, k: int) -> list:
 async def _fetch(url: str, egress: _Egress, scratch_dir: Path, query: str):
     """Fetch one URL, summarize it for the query, write the extract, return a ref.
 
-    Runs the raw page through the cheap auxiliary side-model (``process_content_with_llm``)
+    Runs the raw page through the cheap auxiliary side-model (``summarize_for_query``)
     with the search query, so the returned ref carries a query-relevant ``extract`` INLINE
     (the model answers directly instead of a multi-turn read_file loop). The extract — not the
     raw body — is what lands on disk.
@@ -102,8 +103,8 @@ async def _fetch(url: str, egress: _Egress, scratch_dir: Path, query: str):
     nbytes = len(content.encode("utf-8"))
     egress.account(nbytes)  # egress budget = RAW fetched bytes (unchanged)
     title = result.get("title") or ""
-    extract = await process_content_with_llm(content, url=url, title=title, query=query)
-    # process_content_with_llm returns None (page < min_length, or no aux model), a real
+    extract = await summarize_for_query(content, query, url=url, title=title)
+    # summarize_for_query returns None (page < min_length, or no aux model), a real
     # extract, a truncated-raw+banner string (timeout — keep it), or a bracket placeholder
     # ("[Content too large…]" >2M chars / "[Failed to process…]" all-chunks-failed). Fall
     # back to a CAPPED raw body whenever there's no real extract or only a placeholder —

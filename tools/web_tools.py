@@ -269,8 +269,6 @@ def _is_backend_available(backend: str) -> bool:
         return _has_env("BRAVE_SEARCH_API_KEY")
     if backend == "ddgs":
         return _ddgs_package_importable()
-    if backend == "trafilatura":
-        return _trafilatura_package_importable()
     if backend == "xai":
         # Cheap probe — env var OR auth.json has OAuth tokens. Must not
         # call resolve_xai_http_credentials() here because the OAuth path
@@ -294,21 +292,6 @@ def _ddgs_package_importable() -> bool:
     """
     try:
         import ddgs  # noqa: F401
-        return True
-    except ImportError:
-        return False
-
-
-def _trafilatura_package_importable() -> bool:
-    """Return True when the ``trafilatura`` package can be imported.
-
-    The free in-process page reader (``web.extract_backend: trafilatura``) is
-    available when its opt-in extra is installed. Mirrors
-    ``_ddgs_package_importable`` so ``_is_backend_available`` and tests share a
-    single monkeypatchable symbol.
-    """
-    try:
-        import trafilatura  # noqa: F401
         return True
     except ImportError:
         return False
@@ -400,8 +383,7 @@ async def process_content_with_llm(
     url: str = "", 
     title: str = "",
     model: Optional[str] = None,
-    min_length: int = DEFAULT_MIN_LENGTH_FOR_SUMMARIZATION,
-    query: Optional[str] = None,
+    min_length: int = DEFAULT_MIN_LENGTH_FOR_SUMMARIZATION
 ) -> Optional[str]:
     """
     Process web content using LLM to create intelligent summaries with key excerpts.
@@ -455,13 +437,13 @@ async def process_content_with_llm(
         if content_len > CHUNK_THRESHOLD:
             logger.info("Content large (%d chars). Using chunked processing...", content_len)
             return await _process_large_content_chunked(
-                content, context_str, model, CHUNK_SIZE, MAX_OUTPUT_SIZE, query=query
+                content, context_str, model, CHUNK_SIZE, MAX_OUTPUT_SIZE
             )
         
         # Standard single-pass processing for normal content
         logger.info("Processing content with LLM (%d characters)", content_len)
         
-        processed_content = await _call_summarizer_llm(content, context_str, model, query=query)
+        processed_content = await _call_summarizer_llm(content, context_str, model)
         
         if processed_content:
             # Enforce output cap
@@ -502,8 +484,7 @@ async def _call_summarizer_llm(
     model: Optional[str], 
     max_tokens: int = 20000,
     is_chunk: bool = False,
-    chunk_info: str = "",
-    query: Optional[str] = None,
+    chunk_info: str = ""
 ) -> Optional[str]:
     """
     Make a single LLM call to summarize content.
@@ -519,42 +500,7 @@ async def _call_summarizer_llm(
     Returns:
         Summarized content or None on failure
     """
-    if query:
-        # Query-focused extraction prompts (web_research): keep only what answers the query.
-        if is_chunk:
-            system_prompt = """You are an expert research assistant processing a SECTION of a larger document. Extract ONLY information in THIS SECTION that is directly relevant to the user's research query.
-
-Guidelines:
-1. Do NOT write introductions or conclusions - this is a partial document.
-2. Extract all relevant facts, figures, data points, quotes, and insights; keep numbers, dates, names, and formulas verbatim.
-3. If this section contains nothing relevant to the query, respond with exactly: "No relevant information found."
-4. Use bullet points; your output will be combined with other sections."""
-
-            user_prompt = f"""Research Query: {query}
-
-{context_str}{chunk_info}
-
-SECTION CONTENT:
-{content}
-
-Extract only the information in this section relevant to the query '{query}'."""
-        else:
-            system_prompt = """You are an expert research assistant. Your task is to extract information from the web page content that is directly relevant to the user's research query.
-
-Guidelines:
-1. Extract all relevant facts, data points, figures, quotes, and insights.
-2. Be concise but thorough: keep only what is useful for answering the query.
-3. Keep specific numbers, dates, names, and formulas verbatim.
-4. If the content does not contain any information relevant to the query, respond with exactly: "No relevant information found."
-5. Format your output using clear markdown (e.g. bullet points)."""
-
-            user_prompt = f"""Research Query: {query}
-
-{context_str}CONTENT TO PROCESS:
-{content}
-
-Extract all important information relevant to the query '{query}'."""
-    elif is_chunk:
+    if is_chunk:
         # Chunk-specific prompt - aware that this is partial content
         system_prompt = """You are an expert content analyst processing a SECTION of a larger document. Your job is to extract and summarize the key information from THIS SECTION ONLY.
 
@@ -655,8 +601,7 @@ async def _process_large_content_chunked(
     context_str: str, 
     model: Optional[str], 
     chunk_size: int,
-    max_output_size: int,
-    query: Optional[str] = None,
+    max_output_size: int
 ) -> Optional[str]:
     """
     Process large content by chunking, summarizing each chunk in parallel,
@@ -691,8 +636,7 @@ async def _process_large_content_chunked(
                 model, 
                 max_tokens=10000,
                 is_chunk=True,
-                chunk_info=chunk_info,
-                query=query,
+                chunk_info=chunk_info
             )
             if summary:
                 logger.info("Chunk %d/%d summarized: %d -> %d chars", chunk_idx + 1, len(chunks), len(chunk_content), len(summary))
@@ -738,20 +682,7 @@ async def _process_large_content_chunked(
     
     combined_summaries = "\n\n---\n\n".join(summaries)
     
-    if query:
-        synthesis_prompt = f"""You have been given extracts from different sections of a large document, all relevant to a research query.
-Synthesize them into ONE cohesive, non-redundant extraction that:
-1. Keeps only information relevant to the query: {query}
-2. Preserves all key facts, figures, numbers, dates, names, and quotes verbatim
-3. Is well-organized markdown, under {max_output_size} characters
-4. If no section had relevant information, respond with exactly: "No relevant information found."
-
-{context_str}SECTION EXTRACTS:
-{combined_summaries}
-
-Create a single, unified markdown extraction relevant to the query."""
-    else:
-        synthesis_prompt = f"""You have been given summaries of different sections of a large document. 
+    synthesis_prompt = f"""You have been given summaries of different sections of a large document. 
 Synthesize these into ONE cohesive, comprehensive summary that:
 1. Removes redundancy between sections
 2. Preserves all key facts, figures, and actionable information
@@ -892,47 +823,6 @@ def _ensure_web_plugins_loaded() -> None:
         logger.warning("Web plugin discovery failed (non-fatal): %s", exc)
 
 
-def _get_search_retries() -> int:
-    """Extra retry attempts on a failed/empty ``web_search`` (config-gated).
-
-    Read from ``web.search_retries`` (default 0 = OFF, which preserves the
-    "explicit config = explicit errors" contract). Lets single-engine keyless
-    backends like ddgs ride out a transient DuckDuckGo rate-limit. Clamped to
-    a small ceiling so a misconfig can't spin unbounded.
-    """
-    try:
-        n = int(_load_web_config().get("search_retries", 0))
-    except (TypeError, ValueError):
-        return 0
-    return max(0, min(n, 5))
-
-
-def _search_with_retry(provider, query: str, limit: int) -> dict:
-    """Call ``provider.search`` with optional retry/backoff on failure/empty.
-
-    With ``web.search_retries: 0`` (default) this is a single call — byte-for
-    -byte the pre-retry behaviour. When >0, a retry fires only when the result
-    is unsuccessful OR returns zero web hits (ddgs surfaces a rate-limit as
-    ``success: False``/empty, not an exception), using exponential backoff.
-    """
-    import time
-
-    retries = _get_search_retries()
-    response = provider.search(query, limit)
-    attempt = 0
-    while attempt < retries:
-        if bool(response.get("success")) and response.get("data", {}).get("web"):
-            break
-        attempt += 1
-        time.sleep(0.6 * (2 ** (attempt - 1)))  # 0.6s, 1.2s, 2.4s, ...
-        logger.info(
-            "web_search retry %d/%d via %s (transient failure/empty)",
-            attempt, retries, getattr(provider, "name", "?"),
-        )
-        response = provider.search(query, limit)
-    return response
-
-
 def web_search_tool(query: str, limit: int = 5) -> str:
     """
     Search the web for information using available search API backend.
@@ -1020,7 +910,7 @@ def web_search_tool(query: str, limit: int = 5) -> str:
                 "Web search via %s: '%s' (limit: %d)",
                 provider.name, query, limit,
             )
-            response_data = _search_with_retry(provider, query, limit)
+            response_data = provider.search(query, limit)
 
         debug_call_data["results_count"] = len(response_data.get("data", {}).get("web", []))
         result_json = json.dumps(response_data, indent=2, ensure_ascii=False)
