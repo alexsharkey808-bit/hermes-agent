@@ -197,10 +197,10 @@ WEB_RESEARCH_SCHEMA = {
     "name": "web_research",
     "description": (
         "Research the web at breadth: run one search, fetch the top results CONCURRENTLY, "
-        "save each page body to a scratch dir, and return only compact refs (url, filename, "
-        "byte count). Read back just the bodies you need with search_files / read_file, so a "
-        "wide fan-out costs a few hundred bytes of context instead of many full pages. Falls "
-        "back to a normal inline search+extract if the fan-out cannot complete."
+        "summarize each page for your query via a fast side-model, and return a query-relevant "
+        "EXTRACT inline per result — so you answer directly from the extracts in ~2 turns instead "
+        "of reading pages back one by one. The same extract text is also saved to a scratch dir. "
+        "Falls back to a normal inline search+extract if the fan-out cannot complete."
     ),
     "parameters": {
         "type": "object",
