@@ -32,7 +32,7 @@ from uuid import uuid4
 from hermes_constants import get_hermes_home
 from retrieval.search_primitives import Caps, EgressDenied
 from tools.registry import registry
-from tools.web_tools import _load_web_config, web_extract_tool, web_search_tool
+from tools.web_tools import _load_web_config, process_content_with_llm, web_extract_tool, web_search_tool
 
 logger = logging.getLogger(__name__)
 
@@ -77,8 +77,13 @@ def _search_hits(query: str, k: int) -> list:
     return json.loads(raw).get("data", {}).get("web", []) or []
 
 
-async def _fetch(url: str, egress: _Egress, scratch_dir: Path):
-    """Fetch one URL, write its body to the scratch dir, return a compact ref.
+async def _fetch(url: str, egress: _Egress, scratch_dir: Path, query: str):
+    """Fetch one URL, summarize it for the query, write the extract, return a ref.
+
+    Runs the raw page through the cheap auxiliary side-model (``process_content_with_llm``)
+    with the search query, so the returned ref carries a query-relevant ``extract`` INLINE
+    (the model answers directly instead of a multi-turn read_file loop). The extract — not the
+    raw body — is what lands on disk.
 
     Returns ``None`` (skip + log) when the page yields an error/empty body. Raises
     ``EgressDenied`` when the boundary rejects the host or a per-run cap is exceeded.
@@ -95,10 +100,20 @@ async def _fetch(url: str, egress: _Egress, scratch_dir: Path):
         logger.info("web_research: skip %s (error=%r empty=%s)", url, result.get("error"), not content)
         return None
     nbytes = len(content.encode("utf-8"))
-    egress.account(nbytes)  # byte-cap → EgressDenied propagates
+    egress.account(nbytes)  # egress budget = RAW fetched bytes (unchanged)
+    title = result.get("title") or ""
+    extract = await process_content_with_llm(content, url=url, title=title, query=query)
+    # process_content_with_llm returns None (page < min_length, or no aux model), a real
+    # extract, a truncated-raw+banner string (timeout — keep it), or a bracket placeholder
+    # ("[Content too large…]" >2M chars / "[Failed to process…]" all-chunks-failed). Fall
+    # back to a CAPPED raw body whenever there's no real extract or only a placeholder —
+    # never let a bare placeholder masquerade as a query-relevant extract, never dump a
+    # full page inline.
+    if (not extract) or extract.startswith("[Content too large") or extract.startswith("[Failed to process"):
+        extract = content[:5000]
     fname = hashlib.sha256(url.encode("utf-8")).hexdigest()[:16] + ".txt"
-    (scratch_dir / fname).write_text(content, encoding="utf-8")
-    return {"url": url, "file": fname, "bytes": nbytes}
+    (scratch_dir / fname).write_text(extract, encoding="utf-8")
+    return {"url": url, "file": fname, "bytes": len(extract.encode("utf-8")), "extract": extract}
 
 
 async def _fanout(query: str, k: int, scratch_dir: Path) -> list:
@@ -111,7 +126,7 @@ async def _fanout(query: str, k: int, scratch_dir: Path) -> list:
     urls = [h["url"] for h in hits if h.get("url")]
     allow = {urlparse(u).hostname for u in urls if urlparse(u).hostname}
     egress = _Egress(allow, Caps())
-    results = await asyncio.gather(*[_fetch(u, egress, scratch_dir) for u in urls])
+    results = await asyncio.gather(*[_fetch(u, egress, scratch_dir, query) for u in urls])
     return [r for r in results if r]
 
 
@@ -170,7 +185,11 @@ async def web_research_tool(query: str, k: int = 5) -> str:
     return json.dumps({
         "success": True,
         "data": {"refs": refs, "scratch_dir": str(scratch_dir)},
-        "hint": f"Bodies saved to {scratch_dir}; use search_files/read_file to read only what you need.",
+        "hint": (
+            "Query-relevant extracts are INLINE in each ref's 'extract' field — answer directly from them. "
+            "The same extract text is saved at scratch_dir (NOT the full raw page). If an extract is "
+            "insufficient, re-run web_research with a more specific query, or use web_search/web_extract directly."
+        ),
     })
 
 
@@ -178,10 +197,10 @@ WEB_RESEARCH_SCHEMA = {
     "name": "web_research",
     "description": (
         "Research the web at breadth: run one search, fetch the top results CONCURRENTLY, "
-        "save each page body to a scratch dir, and return only compact refs (url, filename, "
-        "byte count). Read back just the bodies you need with search_files / read_file, so a "
-        "wide fan-out costs a few hundred bytes of context instead of many full pages. Falls "
-        "back to a normal inline search+extract if the fan-out cannot complete."
+        "summarize each page for your query via a fast side-model, and return a query-relevant "
+        "EXTRACT inline per result — so you answer directly from the extracts in ~2 turns instead "
+        "of reading pages back one by one. The same extract text is also saved to a scratch dir. "
+        "Falls back to a normal inline search+extract if the fan-out cannot complete."
     ),
     "parameters": {
         "type": "object",

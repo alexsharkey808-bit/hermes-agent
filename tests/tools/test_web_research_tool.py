@@ -1,12 +1,18 @@
-"""Tests for the gated web_research tool (parallel fan-out + refs-on-disk).
+"""Tests for the gated web_research tool (parallel fan-out + query-aware inline extracts).
 
-No network: web_search_tool / web_extract_tool are faked. HERMES_HOME is the per-test
-temp dir (the _isolate_hermes_home autouse fixture), so scratch dirs land in temp.
+No network: web_search_tool / web_extract_tool / process_content_with_llm are faked. HERMES_HOME
+is the per-test temp dir (the _isolate_hermes_home autouse fixture), so scratch dirs land in temp.
+
+web_research now summarizes each fetched page through the cheap aux model with the search query
+and returns the query-relevant extract INLINE in each ref's "extract" field (the extract — not the
+raw page — is what lands on disk). The mocks patch the names where web_research_tool LOOKS THEM UP
+(`wr.process_content_with_llm` / `wr.web_extract_tool`), not where they're defined.
 """
 
 import asyncio
 import json
 import logging
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -41,33 +47,116 @@ def _set_flag(monkeypatch, enabled):
 
 
 # --------------------------------------------------------------------------
-# Task 3 — async fanout + adapter
+# Task 3 — async fanout + inline query-aware extracts
 # --------------------------------------------------------------------------
 
-def test_async_fanout_writes_bodies_and_returns_refs(tmp_path, monkeypatch):
+def test_async_fanout_writes_extracts_and_returns_refs(tmp_path, monkeypatch):
     monkeypatch.setattr(wr, "web_search_tool", _fake_search)
     monkeypatch.setattr(wr, "web_extract_tool", _fake_extract_ok)
+    # short mocked bodies (<5000 chars) → process_content_with_llm returns None (no network);
+    # mock it explicitly for determinism → _fetch falls back to the (capped) raw body.
+    monkeypatch.setattr(wr, "process_content_with_llm", AsyncMock(return_value=None))
     scratch = tmp_path / "s"
     scratch.mkdir()
 
     refs = asyncio.run(wr._fanout("q", 3, scratch))
 
-    # k bodies land on disk
+    # k extracts land on disk
     files = sorted(scratch.glob("*.txt"))
     assert len(files) == 3
-    # refs carry no inline body text — only url / file / bytes
+    # refs now carry an inline extract alongside url / file / bytes
     assert len(refs) == 3
     for ref in refs:
-        assert set(ref.keys()) == {"url", "file", "bytes"}
-        assert "BODY" not in json.dumps(ref)
+        assert set(ref.keys()) == {"url", "file", "bytes", "extract"}
+        assert ref["extract"]  # inline extract present (None-summary → raw body fallback)
         assert (scratch / ref["file"]).exists()
-        assert ref["bytes"] > 0
+        assert (scratch / ref["file"]).read_text(encoding="utf-8") == ref["extract"]
+        assert ref["bytes"] == len(ref["extract"].encode("utf-8"))
 
     # the egress boundary rejects a host NOT in the run's search-result set
     eg = wr._Egress({"ok.test"}, Caps())
     eg.check("https://ok.test/anything")  # in-set: allowed
     with pytest.raises(EgressDenied):
         eg.check("https://evil.test/x")
+
+
+def test_query_and_title_forwarded_to_summarizer(tmp_path, monkeypatch):
+    monkeypatch.setattr(wr, "web_search_tool", _fake_search)
+    monkeypatch.setattr(wr, "web_extract_tool", _fake_extract_ok)  # title "t"
+    pcwl = AsyncMock(return_value="EXTRACT")
+    monkeypatch.setattr(wr, "process_content_with_llm", pcwl)
+    scratch = tmp_path / "s"
+    scratch.mkdir()
+
+    refs = asyncio.run(wr._fanout("my query", 1, scratch))
+
+    assert len(refs) == 1
+    pcwl.assert_awaited()
+    _, kwargs = pcwl.call_args
+    assert kwargs.get("query") == "my query"          # the search query is forwarded
+    assert kwargs.get("title") == "t"                 # title comes from the web_extract result
+
+
+def test_refs_carry_inline_extract(tmp_path, monkeypatch):
+    monkeypatch.setattr(wr, "web_search_tool", _fake_search)
+    monkeypatch.setattr(wr, "web_extract_tool", _fake_extract_ok)
+    monkeypatch.setattr(wr, "process_content_with_llm", AsyncMock(return_value="EXTRACT"))
+    scratch = tmp_path / "s"
+    scratch.mkdir()
+
+    refs = asyncio.run(wr._fanout("q", 2, scratch))
+
+    assert len(refs) == 2
+    for ref in refs:
+        assert ref["extract"] == "EXTRACT"
+        assert ref["bytes"] == len("EXTRACT".encode("utf-8"))
+        assert (scratch / ref["file"]).read_text(encoding="utf-8") == "EXTRACT"
+
+
+def test_none_extract_falls_back_to_raw(tmp_path, monkeypatch):
+    monkeypatch.setattr(wr, "web_search_tool", _fake_search)
+    monkeypatch.setattr(wr, "web_extract_tool", _fake_extract_ok)  # raw content "BODY-<url>"
+    monkeypatch.setattr(wr, "process_content_with_llm", AsyncMock(return_value=None))
+    scratch = tmp_path / "s"
+    scratch.mkdir()
+
+    refs = asyncio.run(wr._fanout("q", 1, scratch))
+
+    ref = refs[0]
+    assert "extract" in ref
+    assert ref["extract"].startswith("BODY-")  # raw mocked body (capped)
+    assert (scratch / ref["file"]).read_text(encoding="utf-8") == ref["extract"]
+
+
+def test_placeholder_extract_falls_back_to_raw(tmp_path, monkeypatch):
+    monkeypatch.setattr(wr, "web_search_tool", _fake_search)
+    monkeypatch.setattr(wr, "web_extract_tool", _fake_extract_ok)
+    # the >2M-char placeholder must NOT be stored as a "query-relevant extract"
+    placeholder = "[Content too large to process: 3.0MB. Try a more focused source URL.]"
+    monkeypatch.setattr(wr, "process_content_with_llm", AsyncMock(return_value=placeholder))
+    scratch = tmp_path / "s"
+    scratch.mkdir()
+
+    refs = asyncio.run(wr._fanout("q", 1, scratch))
+
+    ref = refs[0]
+    assert not ref["extract"].startswith("[Content too large")
+    assert ref["extract"].startswith("BODY-")  # fell back to the raw body
+
+
+def test_skips_error_and_empty_results(tmp_path, monkeypatch):
+    monkeypatch.setattr(wr, "web_search_tool", _fake_search)
+    monkeypatch.setattr(wr, "web_extract_tool", _fake_extract_all_fail)
+    # process_content_with_llm must NOT be reached for error/empty pages (skipped earlier)
+    pcwl = AsyncMock(return_value="EXTRACT")
+    monkeypatch.setattr(wr, "process_content_with_llm", pcwl)
+    scratch = tmp_path / "s"
+    scratch.mkdir()
+
+    refs = asyncio.run(wr._fanout("q", 3, scratch))
+
+    assert refs == []                 # every error/empty result is skipped → one ref per usable URL
+    pcwl.assert_not_awaited()
 
 
 # --------------------------------------------------------------------------
@@ -89,6 +178,7 @@ def test_returns_refs_when_enabled(monkeypatch):
     _set_flag(monkeypatch, True)
     monkeypatch.setattr(wr, "web_search_tool", _fake_search)
     monkeypatch.setattr(wr, "web_extract_tool", _fake_extract_ok)
+    monkeypatch.setattr(wr, "process_content_with_llm", AsyncMock(return_value="EXTRACT"))
 
     out1 = json.loads(asyncio.run(wr.web_research_tool("q", k=3)))
     out2 = json.loads(asyncio.run(wr.web_research_tool("q", k=3)))
@@ -96,14 +186,14 @@ def test_returns_refs_when_enabled(monkeypatch):
     assert out1["success"] is True
     refs = out1["data"]["refs"]
     assert len(refs) == 3
-    assert all(set(r) == {"url", "file", "bytes"} for r in refs)
-    assert "BODY" not in json.dumps(refs)  # no inline body in the returned payload
+    assert all(set(r) == {"url", "file", "bytes", "extract"} for r in refs)
+    assert all(r["extract"] == "EXTRACT" for r in refs)  # query-relevant extract inline
 
     base = get_hermes_home() / "research" / ".scratch"
     d1, d2 = out1["data"]["scratch_dir"], out2["data"]["scratch_dir"]
     assert d1 != d2  # unique per call — concurrent runs cannot collide
     assert str(base) in d1 and str(base) in d2
-    # bodies actually exist under the unique run dir
+    # extracts actually exist under the unique run dir
     assert sorted(__import__("pathlib").Path(d1).glob("*.txt"))
 
 
