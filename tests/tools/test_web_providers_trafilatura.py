@@ -15,6 +15,11 @@ from __future__ import annotations
 import httpx
 import pytest
 
+# CI/local parity: these tests patch the REAL ``trafilatura`` module (an optional extra),
+# so skip the whole file when it is absent (e.g. in CI). The ddgs tests, by contrast, install
+# a sys.modules stub and stay CI-safe without a skip — do not add importorskip there.
+pytest.importorskip("trafilatura")
+
 from plugins.web.trafilatura.provider import (
     _MAX_CONTENT_CHARS,
     TrafilaturaWebSearchProvider,
