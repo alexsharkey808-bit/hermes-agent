@@ -187,6 +187,9 @@ class WriteResult:
     lsp_diagnostics: Optional[str] = None
     error: Optional[str] = None
     warning: Optional[str] = None
+    # What the bounded, opt-in lint auto-fix changed — None unless ``lint.autofix`` ran.
+    # e.g. {"fixed_count": 3, "summary": "ruff --fix applied (3 line(s) changed)"}.
+    autofix: Optional[Dict[str, Any]] = None
 
     def to_dict(self) -> dict:
         return {k: v for k, v in self.__dict__.items() if v is not None}
@@ -1327,6 +1330,11 @@ class ShellFileOperations(FileOperations):
         if write_result.exit_code != 0:
             return WriteResult(error=f"Failed to write file: {write_result.stdout}")
 
+        # Bounded, opt-in safe auto-fix: fix what we just wrote, re-write, report. When
+        # autofix is off / no fixable issues / over the cap, ``final_content`` stays
+        # ``content`` (byte-identical to today) and ``autofix_summary`` is None.
+        final_content, autofix_summary = self._maybe_autofix(path, content)
+
         # Get bytes written (wc -c is POSIX, works on Linux + macOS)
         stat_cmd = f"wc -c < {self._escape_shell_arg(path)} 2>/dev/null"
         stat_result = self._exec(stat_cmd)
@@ -1334,10 +1342,10 @@ class ShellFileOperations(FileOperations):
         try:
             bytes_written = int(stat_result.stdout.strip())
         except ValueError:
-            bytes_written = len(content.encode('utf-8'))
+            bytes_written = len(final_content.encode('utf-8'))
 
-        # Post-write lint with delta refinement.
-        lint_result = self._check_lint_delta(path, pre_content=pre_content, post_content=content)
+        # Post-write lint with delta refinement (on the possibly-fixed content).
+        lint_result = self._check_lint_delta(path, pre_content=pre_content, post_content=final_content)
 
         # Semantic diagnostics from the LSP layer — separate channel.
         # Only fired when the syntax tier reported clean (no point asking
@@ -1348,7 +1356,7 @@ class ShellFileOperations(FileOperations):
         lsp_diagnostics: Optional[str] = None
         if lint_result.success or lint_result.skipped:
             block = self._maybe_lsp_diagnostics(
-                path, pre_content=pre_content, post_content=content
+                path, pre_content=pre_content, post_content=final_content
             )
             if block:
                 lsp_diagnostics = block
@@ -1358,6 +1366,7 @@ class ShellFileOperations(FileOperations):
             dirs_created=dirs_created,
             lint=lint_result.to_dict() if lint_result else None,
             lsp_diagnostics=lsp_diagnostics,
+            autofix=autofix_summary,
         )
     
     # =========================================================================
@@ -1517,6 +1526,38 @@ class ShellFileOperations(FileOperations):
         result = apply_v4a_operations(operations, self)
         return result
     
+    def _maybe_autofix(self, path: str, content: str):
+        """Bounded, opt-in safe lint auto-fix of the just-written file.
+
+        Returns ``(final_content, summary|None)``. When autofix is disabled, the file isn't a
+        ruff/eslint-opted-in project, nothing is fixable, or the fix exceeds the change cap →
+        ``(content, None)`` (the write stays byte-identical). On an applied fix, re-writes the
+        fixed content atomically and returns it + a summary. Never raises.
+        """
+        from tools import lint_extras
+        if not lint_extras.autofix_enabled():
+            return content, None
+        ext = os.path.splitext(path)[1].lower()
+        try:
+            cap = lint_extras.autofix_max_changes()
+            if ext == ".py" and lint_extras.should_lint_with_ruff(path, has_command=self._has_command):
+                applied, fixed, count, summary = lint_extras.autofix_ruff(path, content, exec_fn=self._exec, max_changes=cap)
+            elif ext in (".js", ".jsx", ".ts", ".tsx") and lint_extras.should_lint_with_eslint(path, has_command=self._has_command):
+                applied, fixed, count, summary = lint_extras.autofix_eslint(path, content, exec_fn=self._exec, max_changes=cap)
+            else:
+                return content, None
+        except Exception:  # noqa: BLE001
+            return content, None
+        if applied and fixed is not None and fixed != content:
+            rewrite = self._atomic_write(path, fixed)
+            if rewrite.exit_code == 0:
+                return fixed, {"fixed_count": count, "summary": summary}
+            return content, None
+        if summary and "exceeds cap" in summary:
+            # A fix was available but bounded out — tell the agent (don't silently drop it).
+            return content, {"applied": False, "summary": summary}
+        return content, None
+
     def _check_lint(self, path: str, content: Optional[str] = None) -> LintResult:
         """
         Run syntax check on a file after editing.
@@ -1538,6 +1579,20 @@ class ShellFileOperations(FileOperations):
             LintResult with status and any errors.
         """
         ext = os.path.splitext(path)[1].lower()
+
+        # Fork overlay (lint_extras): when the project opted into ruff/eslint AND the binary
+        # is present AND the master gate is on, run it for richer findings instead of the plain
+        # syntax linter. Only on the content path (the delta passes pre/post content); falls
+        # through to today's linter otherwise — so the flags-off / no-project-config path is
+        # byte-identical. Graceful-degrade (skipped) on any unavailability.
+        if content is not None:
+            from tools import lint_extras
+            if ext == ".py" and lint_extras.should_lint_with_ruff(path, has_command=self._has_command):
+                ok, output, skipped = lint_extras.run_ruff(path, content, exec_fn=self._exec)
+                return LintResult(skipped=True, message="ruff unavailable") if skipped else LintResult(success=ok, output=output)
+            if ext in (".js", ".jsx", ".ts", ".tsx") and lint_extras.should_lint_with_eslint(path, has_command=self._has_command):
+                ok, output, skipped = lint_extras.run_eslint(path, content, exec_fn=self._exec)
+                return LintResult(skipped=True, message="eslint unavailable") if skipped else LintResult(success=ok, output=output)
 
         # Prefer in-process linter when available.
         inproc = LINTERS_INPROC.get(ext)
@@ -1669,8 +1724,27 @@ class ShellFileOperations(FileOperations):
         # as still broken but annotate that this edit introduced nothing
         # new on top — the agent knows it's inherited state, not fresh
         # damage, without silently dropping the error.
-        pre_lines = {ln.strip() for ln in pre.output.splitlines() if ln.strip()}
-        post_lines = [ln for ln in post.output.splitlines() if ln.strip() and ln.strip() not in pre_lines]
+        # Suppress pre-existing findings, multiplicity-aware + line-number-agnostic.
+        # ruff/eslint embed ``path:line:col:`` in each finding, so an edit that shifts line
+        # numbers would make a pre-existing finding look "new" under a raw-string compare.
+        # ``lint_extras.normalize_finding_line`` strips that prefix for the comparison KEY
+        # (a no-op for py_compile/json/yaml output, which has no such prefix → their behavior
+        # is unchanged), while the full original line (line numbers intact) is what we return.
+        # A Counter keeps a genuinely-NEW duplicate finding from being suppressed.
+        from collections import Counter
+        from tools import lint_extras
+        pre_counts = Counter(
+            lint_extras.normalize_finding_line(ln) for ln in pre.output.splitlines() if ln.strip()
+        )
+        post_lines = []
+        for ln in post.output.splitlines():
+            if not ln.strip():
+                continue
+            key = lint_extras.normalize_finding_line(ln)
+            if pre_counts.get(key, 0) > 0:
+                pre_counts[key] -= 1
+            else:
+                post_lines.append(ln)
 
         if not post_lines:
             # Every error in post was also in pre — this edit didn't make

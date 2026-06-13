@@ -2397,6 +2397,23 @@ DEFAULT_CONFIG = {
     # LSP stays dormant and the in-process syntax check is the only
     # tier — handy for Telegram/Discord chats where the cwd is the
     # user's home directory.
+    "lint": {
+        # Edit-time lint + bounded auto-fix on the write path (tools/lint_extras.py).
+        # ``enabled`` is the master toggle. ruff/eslint additionally require the binary on
+        # PATH AND the project to opt in (a ruff/eslint config up-tree) — so by default this
+        # is a no-op unless the project already uses ruff/eslint. Absent either → today's
+        # syntax check (py_compile / node --check / …), never a crash, never a blocked write.
+        "enabled": True,
+        "ruff_enabled": True,
+        "eslint_enabled": True,
+        # Auto-fix is OPT-IN. When true, after a write the SAFE fixes only (ruff check --fix /
+        # eslint --fix; never --unsafe-fixes) are applied, the file is re-read, and the change
+        # is reported in WriteResult.autofix. Skipped (with a warning) if it would change more
+        # than ``autofix_max_changes`` lines.
+        "autofix": False,
+        "autofix_max_changes": 50,
+    },
+
     "code_intelligence": {
         # Semantic code-navigation tools (find_definition / find_references /
         # document_symbols / workspace_symbols) over the language server.
