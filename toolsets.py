@@ -61,6 +61,9 @@ _HERMES_CORE_TOOLS = [
     # code_intelligence.enabled via check_fn in tools/code_intelligence.py;
     # tool_search-deferred so it never bloats the base menu).
     "find_definition", "find_references", "document_symbols", "workspace_symbols",
+    # Test runner — structured run_tests (gated on verification.enabled + a detectable
+    # runner via check_fn in tools/test_runner.py; tool_search-deferred).
+    "run_tests",
     # Cronjob management
     "cronjob",
     # Cross-platform messaging (gated on gateway running via check_fn)
@@ -103,6 +106,12 @@ TOOLSETS = {
     "code_intelligence": {
         "description": "Semantic code navigation via the language server (definition, references, symbols)",
         "tools": ["find_definition", "find_references", "document_symbols", "workspace_symbols"],
+        "includes": []
+    },
+
+    "verification": {
+        "description": "Run the project's test suite (pytest/jest/vitest/go) and get a structured result",
+        "tools": ["run_tests"],
         "includes": []
     },
     

@@ -2397,6 +2397,17 @@ DEFAULT_CONFIG = {
     # LSP stays dormant and the in-process syntax check is the only
     # tier — handy for Telegram/Discord chats where the cwd is the
     # user's home directory.
+    "verification": {
+        # The run_tests tool (tools/test_runner.py): detect + run the project's test
+        # suite (pytest/jest/vitest/go) and return a structured result. ``enabled`` is the
+        # master toggle; the tool is hidden unless a runner is detectable in the cwd.
+        # The post-edit auto-trigger is a deferred fast-follow — not configured here.
+        "enabled": True,
+        "runner_override": None,        # force a runner (pytest/jest/vitest/go) instead of auto-detect
+        "timeout_seconds": 60,          # hard per-run kill (backend timeout); avoids hanging the agent
+        "max_failures_to_report": 5,    # cap the structured failure list
+    },
+
     "lint": {
         # Edit-time lint + bounded auto-fix on the write path (tools/lint_extras.py).
         # ``enabled`` is the master toggle. ruff/eslint additionally require the binary on
