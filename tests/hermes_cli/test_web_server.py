@@ -520,6 +520,87 @@ class TestWebServerEndpoints:
         resp = self.client.get("/api/profiles/sessions?archived=bogus")
         assert resp.status_code == 400
 
+    def test_sessions_endpoint_reads_requested_profile(self):
+        """The machine dashboard's global profile switcher must retarget
+        the Sessions page, not just config/skills/model pages."""
+        from hermes_state import SessionDB
+        from hermes_cli import profiles as profiles_mod
+
+        worker_home = profiles_mod.get_profile_dir("worker")
+        worker_home.mkdir(parents=True)
+
+        default_db = SessionDB()
+        try:
+            default_db.create_session(session_id="default-only", source="cli")
+            default_db.append_message("default-only", role="user", content="default")
+        finally:
+            default_db.close()
+
+        worker_db = SessionDB(db_path=worker_home / "state.db")
+        try:
+            worker_db.create_session(session_id="worker-only", source="cli")
+            worker_db.append_message("worker-only", role="user", content="worker")
+        finally:
+            worker_db.close()
+
+        resp = self.client.get("/api/sessions?profile=worker&limit=20&min_messages=0")
+        assert resp.status_code == 200
+        data = resp.json()
+        ids = {s["id"] for s in data["sessions"]}
+        assert "worker-only" in ids
+        assert "default-only" not in ids
+        row = next(s for s in data["sessions"] if s["id"] == "worker-only")
+        assert row["profile"] == "worker"
+        assert row["is_default_profile"] is False
+
+        stats = self.client.get("/api/sessions/stats?profile=worker").json()
+        assert stats["total"] == 1
+        assert stats["messages"] == 1
+
+        messages = self.client.get("/api/sessions/worker-only/messages?profile=worker").json()
+        assert [m["content"] for m in messages["messages"]] == ["worker"]
+
+    def test_analytics_endpoints_read_requested_profile(self):
+        from hermes_state import SessionDB
+        from hermes_cli import profiles as profiles_mod
+
+        worker_home = profiles_mod.get_profile_dir("worker")
+        worker_home.mkdir(parents=True)
+
+        default_db = SessionDB()
+        try:
+            default_db.create_session(session_id="default-usage", source="cli", model="default/model")
+            default_db.update_token_counts("default-usage", input_tokens=10, output_tokens=5)
+        finally:
+            default_db.close()
+
+        worker_db = SessionDB(db_path=worker_home / "state.db")
+        try:
+            worker_db.create_session(session_id="worker-usage", source="cli", model="worker/model")
+            worker_db.update_token_counts(
+                "worker-usage",
+                input_tokens=123,
+                output_tokens=45,
+                billing_provider="worker-provider",
+            )
+        finally:
+            worker_db.close()
+
+        usage = self.client.get("/api/analytics/usage?days=7&profile=worker").json()
+        assert usage["totals"]["total_sessions"] == 1
+        assert usage["totals"]["total_input"] == 123
+        assert [m["model"] for m in usage["by_model"]] == ["worker/model"]
+
+        models = self.client.get("/api/analytics/models?days=7&profile=worker").json()
+        assert models["totals"]["distinct_models"] == 1
+        assert models["totals"]["total_input"] == 123
+        assert models["models"][0]["model"] == "worker/model"
+        assert models["models"][0]["provider"] == "worker-provider"
+
+        default_usage = self.client.get("/api/analytics/usage?days=7").json()
+        assert default_usage["totals"]["total_input"] == 10
+        assert default_usage["totals"]["total_output"] == 5
+
     def test_get_sessions_rejects_unknown_archived_value(self):
         resp = self.client.get("/api/sessions?archived=bogus")
         assert resp.status_code == 400
@@ -1880,6 +1961,28 @@ class TestWebServerEndpoints:
         out = _apply_main_model_assignment("not-a-dict", "custom", "m", "http://x/v1")
         assert out == {"provider": "custom", "default": "m", "base_url": "http://x/v1"}
 
+        # api_key follows the same lifecycle as base_url:
+        # supplied → persisted.
+        out = _apply_main_model_assignment(
+            {}, "custom", "m", "http://x/v1", "sk-secret"
+        )
+        assert out["api_key"] == "sk-secret"
+
+        # same provider, no new key → existing key preserved (re-picking a model
+        # on the same custom endpoint must not wipe the saved key).
+        out = _apply_main_model_assignment(
+            {"provider": "custom", "base_url": "http://x/v1", "api_key": "sk-keep"},
+            "custom",
+            "m2",
+        )
+        assert out["api_key"] == "sk-keep"
+
+        # switching providers without a new key → stale key cleared.
+        out = _apply_main_model_assignment(
+            {"provider": "custom", "api_key": "sk-old"}, "openrouter", "m"
+        )
+        assert out["api_key"] == ""
+
     def test_parse_model_ids_handles_openai_and_bare_shapes(self):
         """Model discovery must tolerate the common /v1/models shapes and
         never raise (so a slightly non-standard local endpoint still works)."""
@@ -1935,6 +2038,45 @@ class TestWebServerEndpoints:
         assert model_cfg["provider"] == "custom"
         assert model_cfg["default"] == "llama-3.1-8b"
         assert model_cfg["base_url"] == "http://127.0.0.1:8000/v1"
+
+    def test_set_model_main_custom_persists_api_key_and_registers_provider(self):
+        """A custom endpoint that requires auth must persist model.api_key (where
+        the runtime reads it) AND register a named custom_providers entry so the
+        endpoint reappears as a ready row in the picker — matching the
+        ``hermes model`` custom flow. Regression for the desktop loop where a
+        keyed custom endpoint could never be configured from the GUI."""
+        from hermes_cli.config import load_config
+
+        resp = self.client.post(
+            "/api/model/set",
+            json={
+                "scope": "main",
+                "provider": "custom",
+                "model": "gpt-oss-120b",
+                "base_url": "https://text.example.com/v1",
+                "api_key": "sk-secret",
+            },
+        )
+        assert resp.status_code == 200
+        assert resp.json()["ok"] is True
+
+        cfg = load_config()
+        model_cfg = cfg.get("model")
+        assert isinstance(model_cfg, dict)
+        assert model_cfg["provider"] == "custom"
+        assert model_cfg["base_url"] == "https://text.example.com/v1"
+        assert model_cfg["api_key"] == "sk-secret"
+
+        # Registered in custom_providers (dedup by base_url) so the picker shows
+        # a proper ready row instead of the "needs setup" dead-end.
+        custom = cfg.get("custom_providers") or []
+        assert any(
+            isinstance(e, dict)
+            and e.get("base_url") == "https://text.example.com/v1"
+            and e.get("api_key") == "sk-secret"
+            and e.get("model") == "gpt-oss-120b"
+            for e in custom
+        )
 
     def test_set_model_main_non_custom_clears_stale_base_url(self):
         """Switching to a hosted provider must clear a stale base_url so the
@@ -2360,6 +2502,42 @@ class TestNewEndpoints:
         resp = self.client.get("/api/cron/jobs/nonexistent-id")
         assert resp.status_code == 404
 
+    # --- Automation Blueprints ---
+
+    def test_cron_blueprints_list(self):
+        resp = self.client.get("/api/cron/blueprints")
+        assert resp.status_code == 200
+        blueprints = resp.json()["blueprints"]
+        assert len(blueprints) >= 1
+        first = blueprints[0]
+        assert "fields" in first
+        assert first["command"].startswith("/blueprint")
+        assert first["appUrl"].startswith("hermes://")
+
+    def test_blueprint_instantiate_creates_job(self):
+        resp = self.client.post(
+            "/api/cron/blueprints/instantiate",
+            json={"blueprint": "morning-brief", "values": {"time": "07:30", "deliver": "local"}},
+        )
+        assert resp.status_code == 200
+        job = resp.json()
+        assert (job.get("schedule_display") or "").strip() == "30 7 * * *" or \
+            (job.get("schedule", {}) or {}).get("expr") == "30 7 * * *"
+
+    def test_blueprint_instantiate_unknown_404(self):
+        resp = self.client.post(
+            "/api/cron/blueprints/instantiate",
+            json={"blueprint": "does-not-exist", "values": {}},
+        )
+        assert resp.status_code == 404
+
+    def test_blueprint_instantiate_bad_value_422(self):
+        resp = self.client.post(
+            "/api/cron/blueprints/instantiate",
+            json={"blueprint": "morning-brief", "values": {"time": "99:99"}},
+        )
+        assert resp.status_code == 422
+
     # --- Profiles ---
 
     def test_profiles_list_includes_default(self):
@@ -2455,7 +2633,7 @@ class TestNewEndpoints:
 
         resp = self.client.post(
             "/api/profiles",
-            json={"name": "writer", "clone_from_default": False},
+            json={"name": "writer", "clone_from": None},
         )
 
         assert resp.status_code == 200
@@ -2463,7 +2641,7 @@ class TestNewEndpoints:
         assert wrapper_path.exists()
         assert wrapper_path.read_text() == '#!/bin/sh\nexec hermes -p writer "$@"\n'
 
-    def test_profiles_create_with_clone_from_default_copies_default_skills(self, monkeypatch):
+    def test_profiles_create_with_clone_from_copies_source_skills(self, monkeypatch):
         from hermes_constants import get_hermes_home
         import hermes_cli.profiles as profiles_mod
 
@@ -2474,7 +2652,7 @@ class TestNewEndpoints:
 
         resp = self.client.post(
             "/api/profiles",
-            json={"name": "cloned", "clone_from_default": True},
+            json={"name": "cloned", "clone_from": "default"},
         )
 
         assert resp.status_code == 200
@@ -2507,6 +2685,28 @@ class TestNewEndpoints:
         )
         assert cloned_skill.exists()
 
+    def test_profiles_create_clone_all_from_named_source(self, monkeypatch):
+        from hermes_constants import get_hermes_home
+        import hermes_cli.profiles as profiles_mod
+
+        monkeypatch.setattr(profiles_mod, "create_wrapper_script", lambda name: None)
+
+        assert self.client.post("/api/profiles", json={"name": "full-src"}).status_code == 200
+        source_dir = get_hermes_home() / "profiles" / "full-src"
+        (source_dir / "config.yaml").write_text("model:\n  provider: source-only\n", encoding="utf-8")
+        (source_dir / "workspace" / "artifact.txt").parent.mkdir(parents=True, exist_ok=True)
+        (source_dir / "workspace" / "artifact.txt").write_text("copied", encoding="utf-8")
+
+        resp = self.client.post(
+            "/api/profiles",
+            json={"name": "full-copy", "clone_from": "full-src", "clone_all": True},
+        )
+
+        assert resp.status_code == 200
+        target_dir = get_hermes_home() / "profiles" / "full-copy"
+        assert (target_dir / "config.yaml").read_text(encoding="utf-8") == "model:\n  provider: source-only\n"
+        assert (target_dir / "workspace" / "artifact.txt").read_text(encoding="utf-8") == "copied"
+
     def test_profiles_create_without_clone_seeds_bundled_skills(self, monkeypatch):
         from hermes_constants import get_hermes_home
         import hermes_cli.profiles as profiles_mod
@@ -2523,7 +2723,7 @@ class TestNewEndpoints:
 
         resp = self.client.post(
             "/api/profiles",
-            json={"name": "fresh", "clone_from_default": False},
+            json={"name": "fresh", "clone_from": None},
         )
 
         assert resp.status_code == 200
@@ -2593,7 +2793,12 @@ class TestNewEndpoints:
         assert data["hub_installs"] == [{"identifier": "someuser/some-skill", "pid": 4321}]
 
         # Hub install was scoped to the new profile.
-        assert spawned == [(["-p", "builder", "skills", "install", "someuser/some-skill"], "skills-install")]
+        assert spawned == [
+            (
+                ["-p", "builder", "skills", "install", "someuser/some-skill", "--yes"],
+                "skills-install",
+            )
+        ]
 
         # Verify the writes landed in the NEW profile's config, not the root.
         prof_dir = get_hermes_home() / "profiles" / "builder"
@@ -3093,6 +3298,56 @@ class TestNewEndpoints:
             },
             "top_skills": [],
         }
+
+    def test_models_analytics_merges_session_only_duplicate_into_accounted_provider(self):
+        """Session-only model rows should not render as duplicate zero-token cards.
+
+        Direct-provider-on-OpenRouter sessions can leave one row with only
+        ``model`` populated and another row with token/API accounting plus
+        ``billing_provider``. The Models dashboard should show one provider
+        card, not a real card plus a misleading duplicate empty card.
+        """
+        from hermes_state import SessionDB
+
+        db = SessionDB()
+        try:
+            db.create_session(
+                session_id="deepseek-session-only",
+                source="cli",
+                model="deepseek/deepseek-v4-flash",
+            )
+            db.create_session(
+                session_id="deepseek-accounted",
+                source="cli",
+                model="deepseek/deepseek-v4-flash",
+            )
+            db.update_token_counts(
+                "deepseek-accounted",
+                input_tokens=20_000,
+                output_tokens=7_100,
+                billing_provider="openrouter",
+                api_call_count=9,
+            )
+        finally:
+            db.close()
+
+        resp = self.client.get("/api/analytics/models?days=7")
+        assert resp.status_code == 200
+
+        models = resp.json()["models"]
+        deepseek_rows = [
+            row for row in models
+            if row["model"] == "deepseek/deepseek-v4-flash"
+        ]
+
+        assert len(deepseek_rows) == 1
+        row = deepseek_rows[0]
+        assert row["provider"] == "openrouter"
+        assert row["sessions"] == 2
+        assert row["input_tokens"] == 20_000
+        assert row["output_tokens"] == 7_100
+        assert row["api_calls"] == 9
+        assert row["avg_tokens_per_session"] == 13_550
 
     def test_analytics_usage_includes_skill_breakdown(self):
         from hermes_state import SessionDB
@@ -4652,7 +4907,7 @@ class TestPtyWebSocket:
             while time.monotonic() < deadline:
                 # receive_bytes() blocks; once the child prints its winsize and
                 # exits, the PTY closes and further reads raise. Without this
-                # guard a missed-marker run blocks until the 30s pytest-timeout
+                # guard a missed-marker run blocks until a test timeout
                 # (flaky failure) instead of failing fast on the assert below.
                 try:
                     frame = conn.receive_bytes()
@@ -4981,6 +5236,83 @@ class TestValidateProviderCredential:
     def test_empty_value_rejected(self):
         data = self._post("OPENAI_API_KEY", "   ").json()
         assert data["ok"] is False
+
+    def test_local_endpoint_forwards_api_key_as_bearer(self, monkeypatch):
+        """A custom endpoint that gates /v1/models behind auth must still
+        enumerate models: the optional api_key is sent as a Bearer header so the
+        probe doesn't come back empty (the desktop loop's root cause)."""
+        captured = {}
+
+        class _Resp:
+            status_code = 200
+            is_success = True
+
+            def json(self):
+                return {"data": [{"id": "gpt-oss-120b"}]}
+
+        class _Client:
+            def __init__(self, *a, **k):
+                pass
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+            def get(self, url, *a, headers=None, **k):
+                captured["url"] = url
+                captured["headers"] = headers
+                return _Resp()
+
+        monkeypatch.setattr("httpx.Client", _Client)
+
+        resp = self.client.post(
+            "/api/providers/validate",
+            json={
+                "key": "OPENAI_BASE_URL",
+                "value": "https://text.example.com/v1",
+                "api_key": "sk-secret",
+            },
+        )
+        data = resp.json()
+        assert data["ok"] is True and data["reachable"] is True
+        assert data["models"] == ["gpt-oss-120b"]
+        assert captured["url"] == "https://text.example.com/v1/models"
+        assert captured["headers"] == {"Authorization": "Bearer sk-secret"}
+
+    def test_local_endpoint_without_key_sends_no_auth_header(self, monkeypatch):
+        """No key → no Authorization header (keyless local servers unaffected)."""
+        captured = {}
+
+        class _Resp:
+            status_code = 200
+            is_success = True
+
+            def json(self):
+                return {"data": []}
+
+        class _Client:
+            def __init__(self, *a, **k):
+                pass
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+            def get(self, url, *a, headers=None, **k):
+                captured["headers"] = headers
+                return _Resp()
+
+        monkeypatch.setattr("httpx.Client", _Client)
+
+        self.client.post(
+            "/api/providers/validate",
+            json={"key": "OPENAI_BASE_URL", "value": "http://127.0.0.1:8000/v1"},
+        )
+        assert captured["headers"] is None
 
 
 class TestDesktopCronTicker:
