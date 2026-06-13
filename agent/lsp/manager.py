@@ -45,6 +45,8 @@ from agent.lsp import eventlog
 from agent.lsp.client import (
     DIAGNOSTICS_DOCUMENT_WAIT,
     LSPClient,
+    file_uri,
+    uri_to_path,
 )
 from agent.lsp.servers import (
     ServerContext,
@@ -603,6 +605,234 @@ class LSPService:
             "broken": broken,
             "disabled_servers": sorted(self._disabled_servers),
         }
+
+    # ------------------------------------------------------------------
+    # code navigation (ADDITIVE) — textDocument/{definition,references,
+    # documentSymbol} + workspace/symbol over the existing LSP clients.
+    # All positions here are LSP 0-INDEXED, in and out (the agent-facing
+    # 1-indexing lives in the tool handlers). Every method returns [] on
+    # any failure/timeout — never raises, never mutates diagnostics state.
+    # ------------------------------------------------------------------
+
+    def request_definition_sync(
+        self, file_path: str, line: int, character: int, *, timeout: Optional[float] = None
+    ) -> List[Dict[str, Any]]:
+        """``textDocument/definition`` at 0-indexed ``(line, character)``.
+
+        Returns a list of ``{"path", "line", "character"}`` (0-indexed); ``[]`` on failure.
+        """
+        return self._nav_file_request_sync(
+            file_path,
+            "textDocument/definition",
+            {"position": {"line": line, "character": character}},
+            self._normalize_locations,
+            timeout=timeout,
+        )
+
+    def request_references_sync(
+        self,
+        file_path: str,
+        line: int,
+        character: int,
+        *,
+        include_declaration: bool = True,
+        timeout: Optional[float] = None,
+    ) -> List[Dict[str, Any]]:
+        """``textDocument/references`` at 0-indexed ``(line, character)``."""
+        return self._nav_file_request_sync(
+            file_path,
+            "textDocument/references",
+            {
+                "position": {"line": line, "character": character},
+                "context": {"includeDeclaration": include_declaration},
+            },
+            self._normalize_locations,
+            timeout=timeout,
+        )
+
+    def document_symbols_sync(
+        self, file_path: str, *, timeout: Optional[float] = None
+    ) -> List[Dict[str, Any]]:
+        """``textDocument/documentSymbol`` — symbols defined in ``file_path``.
+
+        Handles both the hierarchical ``DocumentSymbol[]`` and the flat
+        ``SymbolInformation[]`` server responses (children flattened).
+        """
+        return self._nav_file_request_sync(
+            file_path,
+            "textDocument/documentSymbol",
+            {},
+            self._normalize_symbols,
+            timeout=timeout,
+        )
+
+    def workspace_symbols_sync(
+        self, query: str, *, path: Optional[str] = None, timeout: Optional[float] = None
+    ) -> List[Dict[str, Any]]:
+        """``workspace/symbol`` — find symbols matching ``query`` across the workspace.
+
+        Server selection: if ``path`` is given, spawn/select that file's server and
+        query it; otherwise query every CURRENTLY-RUNNING client and merge (servers
+        spawn lazily on first file-open, so with no ``path`` and nothing yet running
+        the result is ``[]`` — not an error).
+        """
+        if not self._enabled:
+            return []
+        t = timeout if timeout is not None else self._wait_timeout + 2.0
+        try:
+            raw = self._loop.run(self._workspace_symbols_async(query, path, t), timeout=t + 1.0)
+        except Exception as e:  # noqa: BLE001
+            logger.debug("LSP workspace/symbol failed for %r: %s", query, e)
+            return []
+        normalized = self._normalize_symbols(raw)
+        # Merge across servers can duplicate — dedup on (path, name, line, character).
+        seen = set()
+        deduped = []
+        for s in normalized:
+            key = (s.get("path"), s.get("name"), s.get("line"), s.get("character"))
+            if key in seen:
+                continue
+            seen.add(key)
+            deduped.append(s)
+        return deduped
+
+    # --- nav internals (additive) -------------------------------------
+
+    def _nav_file_request_sync(
+        self, file_path, method, extra_params, normalizer, *, timeout
+    ) -> List[Dict[str, Any]]:
+        """Shared sync-over-async dispatch for the file-scoped nav requests.
+
+        Mirrors ``get_diagnostics_sync``: gate on ``enabled_for``, run the async
+        helper on the background loop, normalize, return ``[]`` on any error.
+        """
+        if not self.enabled_for(file_path):
+            return []
+        t = timeout if timeout is not None else self._wait_timeout + 2.0
+        try:
+            raw = self._loop.run(
+                self._nav_file_request_async(file_path, method, extra_params, t),
+                timeout=t + 1.0,
+            )
+        except Exception as e:  # noqa: BLE001
+            logger.debug("LSP nav %s failed for %s: %s", method, file_path, e)
+            return []
+        return normalizer(raw)
+
+    async def _nav_file_request_async(self, file_path, method, extra_params, timeout):
+        """Open the doc (didOpen, idempotent) and send one nav request.
+
+        Reuses ``_get_or_spawn`` (the file→client mapping) + ``open_file`` exactly
+        like ``_open_and_wait_async``, but does NOT save / wait_for_diagnostics /
+        snapshot_baseline (nav is read-only and side-effect-free).
+        """
+        client = await self._get_or_spawn(file_path)
+        if client is None:
+            return None
+        try:
+            await client.open_file(file_path, language_id=language_id_for(file_path))
+            params = {"textDocument": {"uri": file_uri(os.path.abspath(file_path))}}
+            params.update(extra_params)
+            self._last_used[(client.server_id, client.workspace_root)] = time.time()
+            return await client._send_request_with_retry(method, params, timeout=timeout)
+        except Exception as e:  # noqa: BLE001
+            logger.debug("LSP nav %s request failed for %s: %s", method, file_path, e)
+            return None
+
+    async def _workspace_symbols_async(self, query, path, timeout):
+        params = {"query": query}
+        if path:
+            client = await self._get_or_spawn(path)
+            clients = [client] if client is not None else []
+        else:
+            with self._state_lock:
+                clients = [c for c in self._clients.values() if c.is_running]
+        results: List[Any] = []
+        for client in clients:
+            try:
+                raw = await client._send_request_with_retry("workspace/symbol", params, timeout=timeout)
+            except Exception as e:  # noqa: BLE001
+                logger.debug("LSP workspace/symbol failed on %s: %s", getattr(client, "server_id", "?"), e)
+                continue
+            if raw:
+                results.extend(raw if isinstance(raw, list) else [raw])
+        return results
+
+    # --- result normalizers (handle the LSP union shapes) -------------
+
+    @staticmethod
+    def _normalize_locations(raw) -> List[Dict[str, Any]]:
+        """``Location`` | ``Location[]`` | ``LocationLink[]`` | ``null`` → list of dicts.
+
+        ``Location`` uses ``uri``/``range``; ``LocationLink`` uses ``targetUri`` +
+        ``targetSelectionRange`` (falling back to ``targetRange``). Output positions
+        are LSP 0-indexed.
+        """
+        if not raw:
+            return []
+        items = raw if isinstance(raw, list) else [raw]
+        out: List[Dict[str, Any]] = []
+        for loc in items:
+            if not isinstance(loc, dict):
+                continue
+            uri = loc.get("uri") or loc.get("targetUri")
+            rng = loc.get("range") or loc.get("targetSelectionRange") or loc.get("targetRange")
+            if not uri or not isinstance(rng, dict):
+                continue
+            start = rng.get("start") or {}
+            out.append({
+                "path": uri_to_path(uri),
+                "line": int(start.get("line", 0)),
+                "character": int(start.get("character", 0)),
+            })
+        return out
+
+    @classmethod
+    def _normalize_symbols(cls, raw) -> List[Dict[str, Any]]:
+        """``DocumentSymbol[]`` (hierarchical) | ``SymbolInformation[]`` /
+        ``WorkspaceSymbol[]`` (flat with ``location``) | ``null`` → flat list of dicts.
+
+        Each entry: ``{"name", "kind", "line", "character"[, "path"][, "container"]}``
+        (0-indexed). ``DocumentSymbol`` children are flattened with the parent as
+        ``container``; flat symbols carry their ``location.uri`` as ``path``.
+        """
+        if not raw:
+            return []
+        out: List[Dict[str, Any]] = []
+        for sym in (raw if isinstance(raw, list) else [raw]):
+            if isinstance(sym, dict):
+                cls._flatten_symbol(sym, out, container=None)
+        return out
+
+    @classmethod
+    def _flatten_symbol(cls, sym, out, container) -> None:
+        name = sym.get("name")
+        kind = sym.get("kind")
+        loc = sym.get("location")
+        if isinstance(loc, dict):  # SymbolInformation / WorkspaceSymbol
+            uri = loc.get("uri")
+            rng = loc.get("range") or {}
+            path = uri_to_path(uri) if uri else None
+        else:  # DocumentSymbol (scoped to the queried file → no uri)
+            uri = None
+            rng = sym.get("selectionRange") or sym.get("range") or {}
+            path = None
+        start = rng.get("start") or {}
+        entry: Dict[str, Any] = {
+            "name": name,
+            "kind": kind,
+            "line": int(start.get("line", 0)),
+            "character": int(start.get("character", 0)),
+        }
+        if path is not None:
+            entry["path"] = path
+        cont = sym.get("containerName") or container
+        if cont:
+            entry["container"] = cont
+        out.append(entry)
+        for child in sym.get("children") or []:
+            if isinstance(child, dict):
+                cls._flatten_symbol(child, out, container=name)
 
 
 def _diag_key(d: Dict[str, Any]) -> str:
