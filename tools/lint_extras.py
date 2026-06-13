@@ -140,14 +140,16 @@ def should_lint_with_ruff(path: str, *, has_command: Optional[Callable[[str], bo
     cfg = cfg if cfg is not None else lint_config()
     if not _flag(cfg, "ruff_enabled", True):
         return False
-    return _available("ruff", has_command) and project_uses_ruff(path)
+    # Cheap filesystem check (project opt-in) FIRST, then probe for the binary — so a file
+    # outside a ruff project never spawns a ``command -v`` subprocess.
+    return project_uses_ruff(path) and _available("ruff", has_command)
 
 
 def should_lint_with_eslint(path: str, *, has_command: Optional[Callable[[str], bool]] = None, cfg: Optional[dict] = None) -> bool:
     cfg = cfg if cfg is not None else lint_config()
     if not _flag(cfg, "eslint_enabled", True):
         return False
-    return _available("eslint", has_command) and project_uses_eslint(path)
+    return project_uses_eslint(path) and _available("eslint", has_command)
 
 
 # --------------------------------------------------------------------------
