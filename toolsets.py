@@ -57,6 +57,10 @@ _HERMES_CORE_TOOLS = [
     "clarify",
     # Code execution + delegation
     "execute_code", "delegate_task",
+    # Code intelligence — LSP-backed semantic navigation (gated on
+    # code_intelligence.enabled via check_fn in tools/code_intelligence.py;
+    # tool_search-deferred so it never bloats the base menu).
+    "find_definition", "find_references", "document_symbols", "workspace_symbols",
     # Cronjob management
     "cronjob",
     # Cross-platform messaging (gated on gateway running via check_fn)
@@ -94,6 +98,12 @@ TOOLSETS = {
         "description": "Web research and content extraction tools",
         "tools": ["web_search", "web_extract", "web_research"],
         "includes": []  # No other toolsets included
+    },
+
+    "code_intelligence": {
+        "description": "Semantic code navigation via the language server (definition, references, symbols)",
+        "tools": ["find_definition", "find_references", "document_symbols", "workspace_symbols"],
+        "includes": []
     },
     
     "search": {

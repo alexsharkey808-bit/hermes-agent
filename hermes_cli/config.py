@@ -2397,6 +2397,15 @@ DEFAULT_CONFIG = {
     # LSP stays dormant and the in-process syntax check is the only
     # tier — handy for Telegram/Discord chats where the cwd is the
     # user's home directory.
+    "code_intelligence": {
+        # Semantic code-navigation tools (find_definition / find_references /
+        # document_symbols / workspace_symbols) over the language server.
+        # When True the tools are exposed (tool_search-deferred, so they never
+        # bloat the base menu); ``lsp.enabled`` below is the master gate — if
+        # LSP is off the tools degrade gracefully to {"ok": false, ...}.
+        "enabled": True,
+    },
+
     "lsp": {
         # Master toggle.  Setting this to false disables the entire
         # subsystem — no servers spawn, no background event loop, no
