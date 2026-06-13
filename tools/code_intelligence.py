@@ -231,18 +231,43 @@ WORKSPACE_SYMBOLS_SCHEMA = {
     },
 }
 
-for _schema, _handler, _emoji in (
-    (FIND_DEFINITION_SCHEMA, find_definition, "🧭"),
-    (FIND_REFERENCES_SCHEMA, find_references, "🔗"),
-    (DOCUMENT_SYMBOLS_SCHEMA, document_symbols, "🗂️"),
-    (WORKSPACE_SYMBOLS_SCHEMA, workspace_symbols, "🔭"),
-):
-    registry.register(
-        name=_schema["name"],
-        toolset="code_intelligence",
-        schema=_schema,
-        handler=(lambda h: lambda args, **kw: h(args))(_handler),
-        check_fn=_code_intelligence_enabled,
-        is_async=False,
-        emoji=_emoji,
-    )
+# Register each tool with a DIRECT top-level ``registry.register(...)`` call — the canonical
+# idiom (see tools/web_research_tool.py). Auto-discovery's AST scan
+# (tools/registry.py::_module_registers_tools) only detects top-level register calls, so a
+# loop-nested call would leave this module un-imported at startup and the tools invisible.
+registry.register(
+    name="find_definition",
+    toolset="code_intelligence",
+    schema=FIND_DEFINITION_SCHEMA,
+    handler=lambda args, **kw: find_definition(args),
+    check_fn=_code_intelligence_enabled,
+    is_async=False,
+    emoji="🧭",
+)
+registry.register(
+    name="find_references",
+    toolset="code_intelligence",
+    schema=FIND_REFERENCES_SCHEMA,
+    handler=lambda args, **kw: find_references(args),
+    check_fn=_code_intelligence_enabled,
+    is_async=False,
+    emoji="🔗",
+)
+registry.register(
+    name="document_symbols",
+    toolset="code_intelligence",
+    schema=DOCUMENT_SYMBOLS_SCHEMA,
+    handler=lambda args, **kw: document_symbols(args),
+    check_fn=_code_intelligence_enabled,
+    is_async=False,
+    emoji="🗂️",
+)
+registry.register(
+    name="workspace_symbols",
+    toolset="code_intelligence",
+    schema=WORKSPACE_SYMBOLS_SCHEMA,
+    handler=lambda args, **kw: workspace_symbols(args),
+    check_fn=_code_intelligence_enabled,
+    is_async=False,
+    emoji="🔭",
+)

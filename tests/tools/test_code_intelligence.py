@@ -102,3 +102,34 @@ def test_results_capped_with_truncated_flag(monkeypatch):
     assert len(payload["results"]) == ci._MAX_RESULTS
     assert payload["truncated"] is True
     assert payload["total"] == ci._MAX_RESULTS + 50
+
+
+# --------------------------------------------------------------------------
+# E2E discovery contract — the for-loop-registration bug these tests now guard
+# (direct-import tests passed but the module was never auto-discovered at startup,
+# so the tools were invisible in production). Exercise the REAL discovery path.
+# --------------------------------------------------------------------------
+
+def test_module_found_by_auto_discovery():
+    from pathlib import Path
+    from tools.registry import discover_builtin_tools, _module_registers_tools
+
+    # AST scan must see a TOP-LEVEL registry.register(...) — a loop-nested call returns False
+    assert _module_registers_tools(Path("tools/code_intelligence.py")) is True
+    assert "tools.code_intelligence" in discover_builtin_tools()
+
+
+def test_tools_register_and_reach_cli_via_real_discovery():
+    import model_tools  # noqa: F401 — import triggers discover_builtin_tools() at startup
+    from hermes_cli.tools_config import _get_platform_tools
+    from toolsets import resolve_toolset
+    from tools.registry import registry
+
+    nav = {"find_definition", "find_references", "document_symbols", "workspace_symbols"}
+    # the 4 tools actually register (check_fn default ON in the isolated test config)
+    registered = {d["function"]["name"] for d in registry.get_definitions(nav)}
+    assert registered == nav
+    # NB: _get_platform_tools returns TOOLSET names (not tool names) — reachability is the
+    # toolset being enabled for cli AND resolving to the 4 nav tools.
+    assert "code_intelligence" in _get_platform_tools({}, "cli")
+    assert nav <= set(resolve_toolset("code_intelligence"))
