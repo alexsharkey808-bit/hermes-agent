@@ -154,3 +154,22 @@ def test_real_pytest_end_to_end(tmp_path, monkeypatch):
     assert out["status"] == "failed"
     assert out["passed"] == 1 and out["failed"] == 1
     assert any(f["test"] == "test_fail" for f in out["failures"])
+
+
+# --------------------------------------------------------------------------
+# discovery contract (the Plan-1 ship-bug guard) + cli reachability
+# --------------------------------------------------------------------------
+
+def test_run_tests_discovered_and_reaches_cli():
+    from pathlib import Path
+    from tools.registry import discover_builtin_tools, _module_registers_tools
+
+    assert _module_registers_tools(Path("tools/test_runner.py")) is True
+    assert "tools.test_runner" in discover_builtin_tools()
+
+    import model_tools  # noqa: F401 — triggers real startup discovery
+    from hermes_cli.tools_config import _get_platform_tools
+    from toolsets import resolve_toolset
+
+    assert "verification" in _get_platform_tools({}, "cli")
+    assert "run_tests" in resolve_toolset("verification")

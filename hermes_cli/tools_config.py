@@ -55,6 +55,7 @@ from hermes_cli.cli_output import (  # noqa: E402 — late import block
 CONFIGURABLE_TOOLSETS = [
     ("web",             "🔍 Web Search & Scraping",    "web_search, web_extract"),
     ("code_intelligence", "🧭 Code Intelligence",      "find_definition, find_references, document_symbols, workspace_symbols"),
+    ("verification",      "🧪 Test Runner",            "run_tests (detect + run pytest/jest/vitest/go)"),
     ("browser",         "🌐 Browser Automation",       "navigate, click, type, scroll"),
     ("terminal",        "💻 Terminal & Processes",      "terminal, process"),
     ("file",            "📁 File Operations",           "read, write, patch, search"),
